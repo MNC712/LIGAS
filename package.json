@@ -1,0 +1,17 @@
+{
+  "name": "flm-clone",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local recreation of the FLM System league management product, built from observed public behaviour.",
+  "engines": { "node": ">=22.5" },
+  "scripts": {
+    "harvest": "node scripts/harvest.mjs",
+    "seed": "node src/seed.mjs",
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs",
+    "test": "node --test test/",
+    "smoke": "node scripts/smoke.mjs",
+    "verify": "node scripts/inspect.mjs"
+  }
+}

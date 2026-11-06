@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Generated SQLite database (recreate with: npm run seed)
+data/flm.db
+data/flm.db-shm
+data/flm.db-wal
+
+# Test / smoke caches and captured reference pages
+.cache/
+
+# Logs and OS files
+*.log
+.DS_Store
+Thumbs.db
