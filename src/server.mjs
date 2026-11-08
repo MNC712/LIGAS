@@ -5,17 +5,18 @@ import { randomBytes } from "node:crypto";
 import { join, extname, normalize } from "node:path";
 import { openDb, all, get, run, ROOT } from "./db.mjs";
 import {
-  theme, fmtDate, verifyPassword, generateSchedule, statusLabel,
-  computeStandings, computePlayerStats, slugify,
+  theme, verifyPassword, statusLabel, slugify, localDateTimeToUtc, localParts,
+  mulberry32, roundRobin, planSchedule, computeGroupSeeds, pairSeeds,
 } from "./domain.mjs";
 import * as repo from "./repo.mjs";
 import * as views from "./public-views.mjs";
 import * as admin from "./admin-views.mjs";
-import { html } from "./render.mjs";
+import { ensureBootstrap } from "./bootstrap.mjs";
 
 const PORT = Number(process.env.PORT || 5173);
 const HOST = process.env.HOST || "127.0.0.1";
 const db = openDb();
+ensureBootstrap(db);
 
 /* ------------------------------------------------------------------ utils */
 
@@ -62,9 +63,65 @@ function sendHtml(res, content, status = 200) {
   res.end(buffer);
 }
 
+function sendJson(res, payload, status = 200) {
+  const buffer = Buffer.from(JSON.stringify(payload), "utf8");
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": buffer.length, "cache-control": "no-store", "x-content-type-options": "nosniff" });
+  res.end(buffer);
+}
+
+// Scripts that manage a match in place ask for JSON; plain form posts keep
+// their redirect so the no-JS flow and the smoke tests are unchanged.
+function wantsJson(req) {
+  return (req.headers.accept || "").includes("application/json") || req.headers["x-requested-with"] === "fetch";
+}
+
+// Serialised live state shared by the polling endpoint and the admin writes.
+function liveBody(gameId) {
+  const snapshot = repo.liveSnapshot(db, gameId);
+  if (!snapshot) return null;
+  const { game, events } = snapshot;
+  return {
+    id: game.id,
+    status: game.status,
+    statusLabel: statusLabel(game.status),
+    live: game.status === "STARTED" || game.status === "BREAK",
+    score: game.score_home !== null && game.score_away !== null ? `${game.score_home} - ${game.score_away}` : "0 - 0",
+    scoreHome: game.score_home,
+    scoreAway: game.score_away,
+    penaltyHome: game.penalty_score_home,
+    penaltyAway: game.penalty_score_away,
+    events: events.map((e) => ({
+      id: e.id,
+      time: e.time,
+      type: e.system_name,
+      typeName: e.type_name,
+      player: e.player_name || e.name || "",
+      team: e.team_name || "",
+      own: Boolean(e.for_opposite_team),
+    })),
+  };
+}
+
 function redirect(res, location, status = 303) {
   res.writeHead(status, { location });
   res.end();
+}
+
+function fail(res, path, message) {
+  const sep = path.includes("?") ? "&" : "?";
+  redirect(res, `${path}${sep}err=${encodeURIComponent(message)}`);
+}
+
+function ok(res, path, message) {
+  const sep = path.includes("?") ? "&" : "?";
+  redirect(res, `${path}${sep}ok=${encodeURIComponent(message)}`);
+}
+
+// A whitespace-free numeric field, or the fallback when it is empty/invalid.
+function int(value, fallback = null) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 async function readBody(req) {
@@ -80,7 +137,15 @@ async function readBody(req) {
   if (type.includes("application/json")) {
     try { return JSON.parse(rawBody || "{}"); } catch { return {}; }
   }
-  return Object.fromEntries(new URLSearchParams(rawBody));
+  // Repeated fields (multi-select checkboxes) must survive as arrays; a single
+  // occurrence stays a string so every existing consumer keeps working.
+  const params = new URLSearchParams(rawBody);
+  const body = {};
+  for (const key of new Set(params.keys())) {
+    const values = params.getAll(key);
+    body[key] = values.length > 1 ? values : values[0];
+  }
+  return body;
 }
 
 function queryObject(url) {
@@ -145,40 +210,22 @@ function requireStaff(req, res) {
 
 /* ============================== public routes ============================ */
 
-const leagueCtx = (league, season) => views.leagueContext(db, league, season);
+const compCtx = (slug) => views.competitionContext(db, slug);
 
 route("GET", "/", (req, res) => redirect(res, "/es"));
-route("GET", "/:lang/tournaments", (req, res) => sendHtml(res, views.tournamentsView(scopeFor(req))));
-route("GET", "/:lang/calendar", (req, res, p) => {
+route("GET", "/:lang/competitions", (req, res) => sendHtml(res, views.competitionsView(scopeFor(req))));
+route("GET", "/:lang/calendar", (req, res) => {
   const url = new URL(req.url, "http://x");
   sendHtml(res, views.calendarView(scopeFor(req), { month: url.searchParams.get("month") }));
 });
-route("GET", "/:lang/gallery", (req, res) => sendHtml(res, views.galleryView(scopeFor(req))));
-route("GET", "/:lang/news", (req, res) => sendHtml(res, views.newsView(scopeFor(req))));
-route("GET", "/:lang/news/:slug", (req, res, p) => {
-  const out = views.postView(scopeFor(req), p.slug);
-  sendHtml(res, out || views.notFoundView(scopeFor(req)), out ? 200 : 404);
-});
-route("GET", "/:lang/contact", (req, res) => {
-  const url = new URL(req.url, "http://x");
-  sendHtml(res, views.contactView(scopeFor(req), { sent: url.searchParams.get("sent") === "1", error: url.searchParams.get("error") || "" }));
-});
-route("POST", "/:lang/contact", async (req, res) => {
-  const body = await readBody(req);
-  if (!body.name || !body.email || !body.message) return redirect(res, "/es/contact?error=Rellena%20todos%20los%20campos%20obligatorios");
-  run(db, "INSERT INTO contact_message (name, email, subject, message, created_at) VALUES (?,?,?,?,?)",
-    body.name, body.email, body.subject || "", body.message, new Date().toISOString());
-  redirect(res, "/es/contact?sent=1");
-});
-
-/* league --------------------------------------------------------------- */
-route("GET", "/:lang/league-menu/seasons-archive", (req, res) => sendHtml(res, views.archiveView(scopeFor(req))));
-route("GET", "/:lang/league-menu/seasons-archive/:season", (req, res, p) => {
+route("GET", "/:lang/archive", (req, res) => sendHtml(res, views.archiveView(scopeFor(req))));
+route("GET", "/:lang/archive/:season", (req, res, p) => {
   const out = views.seasonArchiveView(scopeFor(req), p.season);
   sendHtml(res, out || views.notFoundView(scopeFor(req)), out ? 200 : 404);
 });
+
 for (const [suffix, render] of [
-  ["", (scope, ctx, url) => views.tablesView(scope, ctx)],
+  ["", (scope, ctx) => views.competitionView(scope, ctx)],
   ["/schedule", (scope, ctx) => views.scheduleView(scope, ctx)],
   ["/results", (scope, ctx, url) => views.resultsView(scope, ctx, { page: url.searchParams.get("page") })],
   ["/players-list", (scope, ctx, url) => views.playersView(scope, ctx, {
@@ -186,77 +233,37 @@ for (const [suffix, render] of [
   })],
   ["/regulations", (scope, ctx) => views.regulationsView(scope, ctx)],
 ]) {
-  route("GET", `/:lang/league-menu/:league/:season${suffix}`, (req, res, p) => {
+  route("GET", `/:lang/competition/:slug${suffix}`, (req, res, p) => {
     const scope = scopeFor(req);
-    const ctx = leagueCtx(p.league, p.season);
+    const ctx = compCtx(p.slug);
     if (!ctx) return sendHtml(res, views.notFoundView(scope), 404);
     sendHtml(res, render(scope, ctx, new URL(req.url, "http://x")));
   });
 }
-route("GET", "/:lang/league-menu/:league/:season/teams/:team", (req, res, p) => {
+route("GET", "/:lang/competition/:slug/teams/:team", (req, res, p) => {
   const scope = scopeFor(req);
-  const ctx = leagueCtx(p.league, p.season);
+  const ctx = compCtx(p.slug);
   const out = ctx && views.teamView(scope, ctx, p.team, "about");
   sendHtml(res, out || views.notFoundView(scope), out ? 200 : 404);
 });
 for (const section of ["matches", "players", "gallery"]) {
-  route("GET", `/:lang/league-menu/:league/:season/teams/:team/${section}`, (req, res, p) => {
+  route("GET", `/:lang/competition/:slug/teams/:team/${section}`, (req, res, p) => {
     const scope = scopeFor(req);
-    const ctx = leagueCtx(p.league, p.season);
+    const ctx = compCtx(p.slug);
     const out = ctx && views.teamView(scope, ctx, p.team, section);
     sendHtml(res, out || views.notFoundView(scope), out ? 200 : 404);
   });
 }
-route("GET", "/:lang/league-menu/:league/:season/teams/:team/players/:player", (req, res, p) => {
+route("GET", "/:lang/competition/:slug/teams/:team/players/:player", (req, res, p) => {
   const scope = scopeFor(req);
-  const ctx = leagueCtx(p.league, p.season);
+  const ctx = compCtx(p.slug);
   const out = ctx && views.playerView(scope, ctx, p.team, p.player);
   sendHtml(res, out || views.notFoundView(scope), out ? 200 : 404);
 });
-route("GET", "/:lang/league-menu/:league/:season/games/:game", (req, res, p) => {
+route("GET", "/:lang/competition/:slug/games/:game", (req, res, p) => {
   const scope = scopeFor(req);
-  const ctx = leagueCtx(p.league, p.season);
-  const out = ctx && views.matchView(scope, ctx, "league", p.game);
-  sendHtml(res, out || views.notFoundView(scope), out ? 200 : 404);
-});
-
-/* cup ------------------------------------------------------------------ */
-route("GET", "/:lang/tournament-menu/:cup", (req, res, p) => {
-  const scope = scopeFor(req);
-  const ctx = views.cupContext(db, p.cup);
-  sendHtml(res, ctx ? views.cupBracketView(scope, ctx) : views.notFoundView(scope), ctx ? 200 : 404);
-});
-route("GET", "/:lang/tournament-menu/:cup/final-standings", (req, res, p) => {
-  const scope = scopeFor(req);
-  const ctx = views.cupContext(db, p.cup);
-  sendHtml(res, ctx ? views.cupFinalStandings(scope, ctx) : views.notFoundView(scope), ctx ? 200 : 404);
-});
-route("GET", "/:lang/tournament-menu/:cup/schedule", (req, res, p) => {
-  const scope = scopeFor(req);
-  const ctx = views.cupContext(db, p.cup);
-  sendHtml(res, ctx ? views.cupSchedule(scope, ctx) : views.notFoundView(scope), ctx ? 200 : 404);
-});
-route("GET", "/:lang/tournament-menu/:cup/players-list", (req, res, p) => {
-  const scope = scopeFor(req);
-  const ctx = views.cupContext(db, p.cup);
-  const url = new URL(req.url, "http://x");
-  sendHtml(res, ctx ? views.cupPlayers(scope, ctx, { page: url.searchParams.get("page") }) : views.notFoundView(scope), ctx ? 200 : 404);
-});
-route("GET", "/:lang/tournament-menu/:cup/regulations", (req, res, p) => {
-  const scope = scopeFor(req);
-  const ctx = views.cupContext(db, p.cup);
-  sendHtml(res, ctx ? views.cupRegulations(scope, ctx) : views.notFoundView(scope), ctx ? 200 : 404);
-});
-route("GET", "/:lang/tournament-menu/:cup/teams/:team", (req, res, p) => {
-  const scope = scopeFor(req);
-  const ctx = views.cupContext(db, p.cup);
-  const out = ctx && views.cupTeamView(scope, ctx, p.team);
-  sendHtml(res, out || views.notFoundView(scope), out ? 200 : 404);
-});
-route("GET", "/:lang/tournament-menu/:cup/games/:game", (req, res, p) => {
-  const scope = scopeFor(req);
-  const ctx = views.cupContext(db, p.cup);
-  const out = ctx && views.matchView(scope, ctx, "cup", p.game);
+  const ctx = compCtx(p.slug);
+  const out = ctx && views.matchView(scope, ctx, p.game);
   sendHtml(res, out || views.notFoundView(scope), out ? 200 : 404);
 });
 
@@ -301,11 +308,16 @@ route("GET", "/admin", (req, res) => {
       JOIN game_team gh ON gh.game_id=g.id AND gh.team_type='HOME' JOIN competition_team hc ON hc.id=gh.competition_team_id JOIN team ht ON ht.id=hc.team_id
       JOIN game_team ga ON ga.game_id=g.id AND ga.team_type='AWAY' JOIN competition_team ac ON ac.id=ga.competition_team_id JOIN team at ON at.id=ac.team_id
       WHERE g.status='NOT_STARTED' ORDER BY g.game_date ASC LIMIT 6`);
-  const unread = get(db, "SELECT COUNT(*) n FROM contact_message WHERE read = 0").n;
-  sendHtml(res, admin.dashboardView(scope, { counts, recent, upcoming, unread, user }));
+  sendHtml(res, admin.dashboardView(scope, { counts, recent, upcoming, user }));
 });
 
 /* teams ---------------------------------------------------------------- */
+
+// Every competition, as options for the team-participation checkboxes.
+function competitionOptions(selected = new Set()) {
+  return repo.competitions(db).map((c) => ({ id: c.id, name: c.name, selected: selected.has(c.id) }));
+}
+
 route("GET", "/admin/teams", (req, res) => {
   const user = requireAdmin(req, res); if (!user) return;
   const teams = all(db, `SELECT t.*,
@@ -316,34 +328,31 @@ route("GET", "/admin/teams", (req, res) => {
 });
 route("GET", "/admin/teams/new", (req, res) => {
   const user = requireAdmin(req, res); if (!user) return;
-  const competitions = repo.leagueCompetitions(db).map((c) => ({ id: c.id, name: c.name, selected: false }));
-  sendHtml(res, admin.teamFormView(scopeFor(req), { team: null, competitions, user, query: queryObject(new URL(req.url, "http://x")) }));
+  sendHtml(res, admin.teamFormView(scopeFor(req), { team: null, competitions: competitionOptions(), user, query: queryObject(new URL(req.url, "http://x")) }));
 });
 route("GET", "/admin/teams/:id", (req, res, p) => {
   const user = requireAdmin(req, res); if (!user) return;
   const team = get(db, "SELECT * FROM team WHERE id = ?", Number(p.id));
   if (!team) return redirect(res, "/admin/teams");
   const selected = new Set(all(db, "SELECT competition_id FROM competition_team WHERE team_id = ?", team.id).map((r) => r.competition_id));
-  const competitions = repo.leagueCompetitions(db).map((c) => ({ id: c.id, name: c.name, selected: selected.has(c.id) }));
-  sendHtml(res, admin.teamFormView(scopeFor(req), { team, competitions, user, query: queryObject(new URL(req.url, "http://x")) }));
+  sendHtml(res, admin.teamFormView(scopeFor(req), { team, competitions: competitionOptions(selected), user, query: queryObject(new URL(req.url, "http://x")) }));
 });
 route("POST", "/admin/teams/save", async (req, res) => {
   const user = requireAdmin(req, res); if (!user) return;
   const b = await readBody(req);
   const id = b.id ? Number(b.id) : null;
   const name = String(b.name || "").trim();
-  if (!name) return redirect(res, "/admin/teams?err=El%20nombre%20es%20obligatorio");
+  if (!name) return fail(res, "/admin/teams", "El nombre es obligatorio");
   const slug = slugify(b.slug || name);
   try {
+    let teamId = id;
     if (id) {
       run(db, "UPDATE team SET name=?, name_short=?, slug=?, city=?, about=?, crest_url=? WHERE id=?",
         name, b.name_short || null, slug, b.city || null, b.about || null, b.crest_url || null, id);
     } else {
-      const newId = Number(run(db, "INSERT INTO team (name, name_short, slug, city, about, crest_url) VALUES (?,?,?,?,?,?)",
+      teamId = Number(run(db, "INSERT INTO team (name, name_short, slug, city, about, crest_url) VALUES (?,?,?,?,?,?)",
         name, b.name_short || null, slug, b.city || null, b.about || null, b.crest_url || null).lastInsertRowid);
-      b.__id = newId;
     }
-    const teamId = id || b.__id;
     const wanted = new Set([].concat(b.competitions || []).map(Number));
     const current = all(db, "SELECT id, competition_id FROM competition_team WHERE team_id = ?", teamId);
     for (const row of current) {
@@ -354,44 +363,46 @@ route("POST", "/admin/teams/save", async (req, res) => {
     for (const compId of wanted) {
       run(db, "INSERT OR IGNORE INTO competition_team (competition_id, team_id) VALUES (?,?)", compId, teamId);
     }
-    redirect(res, "/admin/teams?ok=Equipo%20guardado");
+    ok(res, "/admin/teams", "Equipo guardado");
   } catch (e) {
-    redirect(res, `/admin/teams?err=${encodeURIComponent(e.message)}`);
+    fail(res, "/admin/teams", e.message);
   }
 });
 route("POST", "/admin/teams/:id/delete", (req, res, p) => {
   const user = requireAdmin(req, res); if (!user) return;
   const used = get(db, `SELECT COUNT(*) n FROM competition_team ct JOIN game_team gt ON gt.competition_team_id = ct.id WHERE ct.team_id = ?`, Number(p.id)).n;
-  if (used) return redirect(res, "/admin/teams?err=El%20equipo%20tiene%20partidos%20y%20no%20se%20puede%20eliminar");
+  if (used) return fail(res, "/admin/teams", "El equipo tiene partidos y no se puede eliminar");
   try {
     run(db, "DELETE FROM team WHERE id = ?", Number(p.id));
-    redirect(res, "/admin/teams?ok=Equipo%20eliminado");
-  } catch (e) { redirect(res, `/admin/teams?err=${encodeURIComponent(e.message)}`); }
+    ok(res, "/admin/teams", "Equipo eliminado");
+  } catch (e) { fail(res, "/admin/teams", e.message); }
 });
 
 /* players -------------------------------------------------------------- */
-function leagueCompetitionId() {
-  const c = get(db, "SELECT id FROM competition WHERE type='LEAGUE' ORDER BY id LIMIT 1");
-  return c ? c.id : null;
+
+function rosterTeamOptions() {
+  return all(db, `SELECT ct.id, t.name, c.name AS competition FROM competition_team ct
+    JOIN team t ON t.id = ct.team_id JOIN competition c ON c.id = ct.competition_id
+    ORDER BY t.name`);
 }
+
 route("GET", "/admin/players", (req, res) => {
   const user = requireAdmin(req, res); if (!user) return;
   const url = new URL(req.url, "http://x");
   const q = (url.searchParams.get("q") || "").trim();
   const teamId = url.searchParams.get("team") || "";
-  const competitionId = leagueCompetitionId();
-  const params = [competitionId];
+  const params = [];
   let sql = `SELECT p.*, cp.id AS competition_player_id, cp.squad_number, cp.competition_team_id,
       (p.first_name || ' ' || p.last_name) AS full_name, t.name AS team_name
     FROM player p
-    LEFT JOIN competition_player cp ON cp.player_id = p.id AND cp.competition_id = ?
+    LEFT JOIN competition_player cp ON cp.player_id = p.id
     LEFT JOIN competition_team ct ON ct.id = cp.competition_team_id
     LEFT JOIN team t ON t.id = ct.team_id WHERE 1=1`;
   if (q) { sql += " AND (p.first_name LIKE ? OR p.last_name LIKE ?)"; params.push(`%${q}%`, `%${q}%`); }
   if (teamId) { sql += " AND ct.team_id = ?"; params.push(Number(teamId)); }
   sql += " ORDER BY p.last_name, p.first_name LIMIT 500";
   const players = all(db, sql, ...params);
-  const teams = all(db, `SELECT DISTINCT t.id, t.name FROM team t JOIN competition_team ct ON ct.team_id=t.id WHERE ct.competition_id = ? ORDER BY t.name`, competitionId);
+  const teams = all(db, `SELECT DISTINCT t.id, t.name FROM team t JOIN competition_team ct ON ct.team_id=t.id ORDER BY t.name`);
   sendHtml(res, admin.adminPlayersView(scopeFor(req), { players, teams, q, teamId, user, query: queryObject(url) }));
 });
 route("GET", "/admin/players/new", (req, res) => {
@@ -402,26 +413,20 @@ route("GET", "/admin/players/new", (req, res) => {
 });
 route("GET", "/admin/players/:id", (req, res, p) => {
   const user = requireAdmin(req, res); if (!user) return;
-  const competitionId = leagueCompetitionId();
   const player = get(db, `SELECT p.*, cp.id AS competition_player_id, cp.squad_number, cp.competition_team_id
-    FROM player p LEFT JOIN competition_player cp ON cp.player_id = p.id AND cp.competition_id = ? WHERE p.id = ?`,
-    competitionId, Number(p.id));
+    FROM player p LEFT JOIN competition_player cp ON cp.player_id = p.id WHERE p.id = ? ORDER BY cp.id LIMIT 1`,
+    Number(p.id));
   if (!player) return redirect(res, "/admin/players");
   sendHtml(res, admin.adminPlayerFormView(scopeFor(req), {
     player, teams: rosterTeamOptions(), user, query: queryObject(new URL(req.url, "http://x")),
   }));
 });
-function rosterTeamOptions() {
-  return all(db, `SELECT ct.id, t.name, c.name AS competition FROM competition_team ct
-    JOIN team t ON t.id = ct.team_id JOIN competition c ON c.id = ct.competition_id
-    ORDER BY t.name`);
-}
 route("POST", "/admin/players/save", async (req, res) => {
   const user = requireAdmin(req, res); if (!user) return;
   const b = await readBody(req);
   const first = String(b.first_name || "").trim();
   const last = String(b.last_name || "").trim();
-  if (!first || !last) return redirect(res, "/admin/players?err=El%20nombre%20es%20obligatorio");
+  if (!first || !last) return fail(res, "/admin/players", "El nombre es obligatorio");
   const slug = slugify(`${first} ${last}`);
   const id = b.id ? Number(b.id) : null;
   try {
@@ -433,127 +438,576 @@ route("POST", "/admin/players/save", async (req, res) => {
       playerId = Number(run(db, "INSERT INTO player (first_name, last_name, slug, date_of_birth, about, avatar_url) VALUES (?,?,?,?,?,?)",
         first, last, slug, b.date_of_birth || null, b.about || null, b.avatar_url || null).lastInsertRowid);
     }
-    const competitionId = leagueCompetitionId();
+    // The competition is owned by the chosen squad slot, so no competition
+    // context has to be guessed here.
     const ctId = b.competition_team_id ? Number(b.competition_team_id) : null;
     if (ctId) {
-      const existing = get(db, "SELECT id FROM competition_player WHERE competition_id = ? AND player_id = ?", competitionId, playerId);
-      if (existing) {
-        run(db, "UPDATE competition_player SET competition_team_id=?, squad_number=? WHERE id=?", ctId, b.squad_number || null, existing.id);
-      } else {
-        run(db, "INSERT INTO competition_player (competition_id, competition_team_id, player_id, squad_number) VALUES (?,?,?,?)",
-          competitionId, ctId, playerId, b.squad_number || null);
+      const ct = get(db, "SELECT competition_id FROM competition_team WHERE id = ?", ctId);
+      if (ct) {
+        const existing = get(db, "SELECT id FROM competition_player WHERE competition_id = ? AND player_id = ?", ct.competition_id, playerId);
+        if (existing) {
+          run(db, "UPDATE competition_player SET competition_team_id=?, squad_number=? WHERE id=?", ctId, b.squad_number || null, existing.id);
+        } else {
+          run(db, "INSERT INTO competition_player (competition_id, competition_team_id, player_id, squad_number) VALUES (?,?,?,?)",
+            ct.competition_id, ctId, playerId, b.squad_number || null);
+        }
       }
     }
-    redirect(res, "/admin/players?ok=Jugador%20guardado");
+    ok(res, "/admin/players", "Jugador guardado");
   } catch (e) {
-    redirect(res, `/admin/players?err=${encodeURIComponent(e.message)}`);
+    fail(res, "/admin/players", e.message);
   }
 });
 route("POST", "/admin/players/:id/delete", (req, res, p) => {
   const user = requireAdmin(req, res); if (!user) return;
   try {
     run(db, "DELETE FROM player WHERE id = ?", Number(p.id));
-    redirect(res, "/admin/players?ok=Jugador%20eliminado");
-  } catch (e) { redirect(res, `/admin/players?err=${encodeURIComponent(e.message)}`); }
+    ok(res, "/admin/players", "Jugador eliminado");
+  } catch (e) { fail(res, "/admin/players", e.message); }
 });
 
 /* competitions --------------------------------------------------------- */
+
+// All teams with their participation and group inside one competition.
+function teamsForCompetition(competitionId) {
+  const rows = all(db, "SELECT team_id, group_id FROM competition_team WHERE competition_id = ?", competitionId);
+  const assigned = new Map(rows.map((r) => [r.team_id, r]));
+  return all(db, "SELECT * FROM team ORDER BY name").map((t) => ({
+    id: t.id,
+    name: t.name,
+    in_competition: assigned.has(t.id),
+    group_id: assigned.get(t.id)?.group_id ?? null,
+  }));
+}
+
+function competitionSettingsBody(b) {
+  return [
+    String(b.name || "").trim(),
+    int(b.season_id),
+    b.about || null,
+    b.regulations || null,
+    int(b.half_time, 10),
+    int(b.points_win, 3),
+    int(b.points_draw, 1),
+    int(b.points_lose, 0),
+    b.ranking_points || "DESC",
+    b.ranking_goal_diff || "DESC",
+    b.ranking_goals_scored || "DESC",
+    int(b.red_card_matches, 1),
+    b.is_archive ? 1 : 0,
+    b.start_date || null,
+    b.end_date || null,
+    b.location ? String(b.location).trim() : null,
+  ];
+}
+
 route("GET", "/admin/competitions", (req, res) => {
   const user = requireAdmin(req, res); if (!user) return;
-  const competitions = all(db, `SELECT c.*, s.name AS season_name,
-      (SELECT COUNT(*) FROM competition_team ct WHERE ct.competition_id=c.id) teams,
-      (SELECT COUNT(*) FROM game g JOIN round r ON r.id=g.round_id WHERE r.competition_id=c.id) games
-    FROM competition c LEFT JOIN season s ON s.id=c.season_id ORDER BY c.id`);
-  sendHtml(res, admin.competitionsView(scopeFor(req), { competitions, user, query: queryObject(new URL(req.url, "http://x")) }));
+  sendHtml(res, admin.competitionsView(scopeFor(req), {
+    competitions: repo.competitions(db), user, query: queryObject(new URL(req.url, "http://x")),
+  }));
+});
+route("GET", "/admin/competitions/new", (req, res) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  sendHtml(res, admin.competitionFormView(scopeFor(req), {
+    competition: null, seasons: repo.seasons(db), groups: [], rounds: [], teams: [], user, query: queryObject(new URL(req.url, "http://x")),
+  }));
 });
 route("GET", "/admin/competitions/:id", (req, res, p) => {
   const user = requireAdmin(req, res); if (!user) return;
   const competition = get(db, `SELECT c.*, s.name AS season_name FROM competition c LEFT JOIN season s ON s.id=c.season_id WHERE c.id = ?`, Number(p.id));
   if (!competition) return redirect(res, "/admin/competitions");
-  sendHtml(res, admin.competitionFormView(scopeFor(req), { competition, user, query: queryObject(new URL(req.url, "http://x")) }));
+  sendHtml(res, admin.competitionFormView(scopeFor(req), {
+    competition,
+    seasons: repo.seasons(db),
+    groups: repo.groupsForCompetition(db, competition.id),
+    rounds: repo.roundsForCompetition(db, competition.id),
+    teams: teamsForCompetition(competition.id),
+    seeds: computeGroupSeeds(db, competition.id),
+    pitches: all(db, "SELECT * FROM pitch ORDER BY name"),
+    user, query: queryObject(new URL(req.url, "http://x")),
+  }));
 });
+route("POST", "/admin/competitions/create", async (req, res) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  const b = await readBody(req);
+  const [name, seasonId, about, regulations, halfTime, pw, pd, pl, rp, rgd, rgs, redCard, archive, startDate, endDate, location] = competitionSettingsBody(b);
+  if (!name) return fail(res, "/admin/competitions/new", "El nombre es obligatorio");
+  const kind = ["LIGA", "TORNEO", "COPA"].includes(b.kind) ? b.kind : "TORNEO";
+  const slug = slugify(b.slug || name);
+  try {
+    const id = Number(run(db, `INSERT INTO competition
+        (slug, name, kind, season_id, about, regulations, half_time, points_win, points_draw, points_lose,
+         ranking_points, ranking_goal_diff, ranking_goals_scored, red_card_suspension_matches, is_archive,
+         start_date, end_date, location)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      slug, name, kind, seasonId, about, regulations, halfTime, pw, pd, pl, rp, rgd, rgs, redCard, archive,
+      startDate, endDate, location).lastInsertRowid);
+    applyCompetitionTemplate(id, kind);
+    ok(res, `/admin/competitions/${id}`, "Competición creada");
+  } catch (e) {
+    fail(res, "/admin/competitions/new", e.message);
+  }
+});
+
+// Templates pre-build the starting structure so the admin can fill in teams
+// and games right away. Everything stays editable afterwards.
+function applyCompetitionTemplate(competitionId, kind) {
+  if (kind === "LIGA") {
+    run(db, "INSERT INTO competition_group (competition_id, name, slug, ordering) VALUES (?,?,?,?)",
+      competitionId, "Grupo A", "grupo-a", 1);
+  } else if (kind === "TORNEO") {
+    for (const [i, name] of ["Grupo A", "Grupo B"].entries()) {
+      run(db, "INSERT INTO competition_group (competition_id, name, slug, ordering) VALUES (?,?,?,?)",
+        competitionId, name, slugify(name), i + 1);
+    }
+    for (const [i, name] of ["Semifinales", "Final"].entries()) {
+      run(db, "INSERT INTO round (competition_id, group_id, stage, name, ordering) VALUES (?,?,?,?,?)",
+        competitionId, null, "PLAYOFF", name, i + 1);
+    }
+  } else if (kind === "COPA") {
+    for (const [i, name] of ["Octavos", "Cuartos", "Semifinales", "Final"].entries()) {
+      run(db, "INSERT INTO round (competition_id, group_id, stage, name, ordering) VALUES (?,?,?,?,?)",
+        competitionId, null, "PLAYOFF", name, i + 1);
+    }
+  }
+}
 route("POST", "/admin/competitions/:id/save", async (req, res, p) => {
   const user = requireAdmin(req, res); if (!user) return;
   const b = await readBody(req);
-  run(db, `UPDATE competition SET name=?, half_time=?, points_win=?, points_draw=?, points_lose=?,
-      ranking_points=?, ranking_goal_diff=?, ranking_goals_scored=?, red_card_suspension_matches=?, is_archive=? WHERE id=?`,
-    b.name, Number(b.half_time) || 10, Number(b.points_win), Number(b.points_draw), Number(b.points_lose),
-    b.ranking_points, b.ranking_goal_diff, b.ranking_goals_scored,
-    Number(b.red_card_matches) || 0, b.is_archive ? 1 : 0, Number(p.id));
-  redirect(res, `/admin/competitions/${p.id}?ok=Ajustes%20guardados`);
-});
-
-/* schedule ------------------------------------------------------------- */
-route("GET", "/admin/schedule", (req, res) => {
-  const user = requireAdmin(req, res); if (!user) return;
-  const url = new URL(req.url, "http://x");
-  const competitions = repo.leagueCompetitions(db).concat(repo.cupCompetitions(db));
-  const selected = Number(url.searchParams.get("competition") || competitions[0]?.id);
-  const rounds = all(db, `SELECT r.*,
-      (SELECT COUNT(*) FROM game g WHERE g.round_id=r.id) games,
-      (SELECT COUNT(*) FROM game g WHERE g.round_id=r.id AND g.status='FINISHED') finished
-    FROM round r WHERE r.competition_id = ? ORDER BY r.id`, selected);
-  sendHtml(res, admin.scheduleAdminView(scopeFor(req), {
-    competitions, selected, rounds, pitches: all(db, "SELECT * FROM pitch ORDER BY name"),
-    user, query: queryObject(url),
-  }));
-});
-route("POST", "/admin/schedule/generate", async (req, res) => {
-  const user = requireAdmin(req, res); if (!user) return;
-  const b = await readBody(req);
+  const [name, seasonId, about, regulations, halfTime, pw, pd, pl, rp, rgd, rgs, redCard, archive, startDate, endDate, location] = competitionSettingsBody(b);
+  if (!name) return fail(res, `/admin/competitions/${p.id}`, "El nombre es obligatorio");
+  const slug = slugify(b.slug || name);
   try {
-    const competitionId = Number(b.competition_id);
-    const times = String(b.times || "18:00").split(",").map((t) => t.trim()).filter(Boolean);
-    for (const t of times) if (!/^\d{1,2}:\d{2}$/.test(t)) throw new Error(`Invalid time: ${t}`);
-    const created = generateSchedule(db, competitionId, {
-      startDate: b.start_date,
-      weekday: Number(b.weekday ?? 6),
-      times,
-      pitchId: b.pitch_id ? Number(b.pitch_id) : null,
-      doubleRound: Boolean(b.double_round),
-      timeZone: scopeFor(req).theme.timezone,
-    });
-    run(db, "INSERT INTO change_log (user_id, action, target, detail, created_at) VALUES (?,?,?,?,?)",
-      user.id, "GENERATE_SCHEDULE", `competition:${competitionId}`, JSON.stringify({ rounds: created.length }), new Date().toISOString());
-    redirect(res, `/admin/schedule?competition=${competitionId}&ok=${encodeURIComponent(`${created.length} jornadas generadas`)}`);
+    run(db, `UPDATE competition SET slug=?, name=?, season_id=?, about=?, regulations=?, half_time=?,
+        points_win=?, points_draw=?, points_lose=?, ranking_points=?, ranking_goal_diff=?,
+        ranking_goals_scored=?, red_card_suspension_matches=?, is_archive=?,
+        start_date=?, end_date=?, location=? WHERE id=?`,
+      slug, name, seasonId, about, regulations, halfTime, pw, pd, pl, rp, rgd, rgs, redCard, archive,
+      startDate, endDate, location, Number(p.id));
+    ok(res, `/admin/competitions/${p.id}`, "Ajustes guardados");
   } catch (e) {
-    redirect(res, `/admin/schedule?err=${encodeURIComponent(e.message)}`);
+    fail(res, `/admin/competitions/${p.id}`, e.message);
   }
 });
-route("POST", "/admin/schedule/rounds/:id/delete", (req, res, p) => {
+route("POST", "/admin/competitions/:id/delete", (req, res, p) => {
   const user = requireAdmin(req, res); if (!user) return;
-  const round = get(db, "SELECT * FROM round WHERE id = ?", Number(p.id));
-  if (!round) return redirect(res, "/admin/schedule");
-  const finished = get(db, "SELECT COUNT(*) n FROM game WHERE round_id = ? AND status='FINISHED'", round.id).n;
-  if (finished) return redirect(res, `/admin/schedule?competition=${round.competition_id}&err=${encodeURIComponent("La jornada ya tiene partidos finalizados")}`);
-  run(db, "DELETE FROM round WHERE id = ?", round.id);
-  redirect(res, `/admin/schedule?competition=${round.competition_id}&ok=Jornada%20eliminada`);
+  const compId = Number(p.id);
+  // Games outlive their round (round_id is set null on cascade), so remove them
+  // first to avoid orphan rows, then let the competition cascade the rest.
+  run(db, "DELETE FROM game WHERE round_id IN (SELECT id FROM round WHERE competition_id = ?)", compId);
+  run(db, "DELETE FROM competition WHERE id = ?", compId);
+  ok(res, "/admin/competitions", "Competición eliminada");
+});
+
+/* groups --------------------------------------------------------------- */
+route("POST", "/admin/competitions/:id/groups/save", async (req, res, p) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  const compId = Number(p.id);
+  const b = await readBody(req);
+  const name = String(b.name || "").trim();
+  if (!name) return fail(res, `/admin/competitions/${compId}`, "El nombre del grupo es obligatorio");
+  const ordering = int(b.ordering, 0);
+  try {
+    if (b.id) {
+      run(db, "UPDATE competition_group SET name=?, ordering=? WHERE id=? AND competition_id=?", name, ordering, Number(b.id), compId);
+    } else {
+      run(db, "INSERT INTO competition_group (competition_id, name, slug, ordering) VALUES (?,?,?,?)", compId, name, slugify(name), ordering);
+    }
+    ok(res, `/admin/competitions/${compId}`, "Grupo guardado");
+  } catch (e) {
+    fail(res, `/admin/competitions/${compId}`, e.message);
+  }
+});
+route("POST", "/admin/competitions/:id/groups/:gid/delete", (req, res, p) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  const compId = Number(p.id);
+  const gid = Number(p.gid);
+  // Deleting a group would cascade its rounds, so block it while dependencies exist.
+  const teams = get(db, "SELECT COUNT(*) n FROM competition_team WHERE group_id = ?", gid).n;
+  const rounds = get(db, "SELECT COUNT(*) n FROM round WHERE group_id = ?", gid).n;
+  if (teams || rounds) return fail(res, `/admin/competitions/${compId}`, "El grupo tiene equipos o jornadas y no se puede eliminar");
+  run(db, "DELETE FROM competition_group WHERE id = ? AND competition_id = ?", gid, compId);
+  ok(res, `/admin/competitions/${compId}`, "Grupo eliminado");
+});
+
+/* teams of a competition ----------------------------------------------- */
+route("POST", "/admin/competitions/:id/teams/save", async (req, res, p) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  const compId = Number(p.id);
+  const b = await readBody(req);
+  const wanted = new Set([].concat(b.teams || []).map(Number));
+  const groupIds = new Set(all(db, "SELECT id FROM competition_group WHERE competition_id = ?", compId).map((g) => g.id));
+  const existing = new Map(all(db, "SELECT id, team_id FROM competition_team WHERE competition_id = ?", compId).map((r) => [r.team_id, r]));
+  for (const t of all(db, "SELECT id FROM team")) {
+    const row = existing.get(t.id);
+    const raw = b[`group_${t.id}`];
+    const groupId = raw && groupIds.has(Number(raw)) ? Number(raw) : null;
+    if (wanted.has(t.id)) {
+      if (row) run(db, "UPDATE competition_team SET group_id=? WHERE id=?", groupId, row.id);
+      else run(db, "INSERT INTO competition_team (competition_id, team_id, group_id) VALUES (?,?,?)", compId, t.id, groupId);
+    } else if (row) {
+      const used = get(db, "SELECT COUNT(*) n FROM game_team WHERE competition_team_id = ?", row.id).n;
+      if (!used) run(db, "DELETE FROM competition_team WHERE id = ?", row.id);
+    }
+  }
+  ok(res, `/admin/competitions/${compId}`, "Equipos guardados");
+});
+
+/* rounds --------------------------------------------------------------- */
+route("POST", "/admin/competitions/:id/rounds/save", async (req, res, p) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  const compId = Number(p.id);
+  const b = await readBody(req);
+  const name = String(b.name || "").trim();
+  if (!name) return fail(res, `/admin/competitions/${compId}`, "El nombre de la jornada es obligatorio");
+  const stage = b.stage === "PLAYOFF" ? "PLAYOFF" : "GROUP";
+  const groupIds = new Set(all(db, "SELECT id FROM competition_group WHERE competition_id = ?", compId).map((g) => g.id));
+  const raw = b.group_id;
+  const groupId = stage === "GROUP" && raw && groupIds.has(Number(raw)) ? Number(raw) : null;
+  try {
+    run(db, "INSERT INTO round (competition_id, group_id, stage, name, ordering) VALUES (?,?,?,?,?)",
+      compId, groupId, stage, name, int(b.ordering, 0));
+    ok(res, `/admin/competitions/${compId}`, "Jornada añadida");
+  } catch (e) {
+    fail(res, `/admin/competitions/${compId}`, e.message);
+  }
+});
+route("POST", "/admin/competitions/:id/rounds/:rid/delete", (req, res, p) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  const compId = Number(p.id);
+  const rid = Number(p.rid);
+  const games = get(db, "SELECT COUNT(*) n FROM game WHERE round_id = ?", rid).n;
+  if (games) return fail(res, `/admin/competitions/${compId}`, "La jornada tiene partidos y no se puede eliminar");
+  run(db, "DELETE FROM round WHERE id = ? AND competition_id = ?", rid, compId);
+  ok(res, `/admin/competitions/${compId}`, "Jornada eliminada");
+});
+
+/* fixtures, scheduling and bracket seeding ----------------------------- */
+
+// Generate random round-robin fixtures for one group (or the whole group
+// stage when there are no groups). Only pending games are replaced, so the
+// draw can be regenerated as many times as needed; played games are kept.
+route("POST", "/admin/competitions/:id/fixtures/generate", async (req, res, p) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  const compId = Number(p.id);
+  const back = `/admin/competitions/${compId}`;
+  const b = await readBody(req);
+  const groupId = int(b.group_id);
+  const doubleRound = Boolean(b.double);
+  const random = mulberry32(Date.now());
+
+  const groups = groupId
+    ? all(db, "SELECT * FROM competition_group WHERE id = ? AND competition_id = ?", groupId, compId)
+    : all(db, "SELECT * FROM competition_group WHERE competition_id = ? ORDER BY ordering, id", compId);
+  const targets = groups.length ? groups : [null]; // null = group stage without groups
+
+  // Protect history: refuse if any group-stage game already started.
+  for (const g of targets) {
+    const params = g ? [compId, g.id] : [compId];
+    const sql = `SELECT COUNT(*) n FROM game g JOIN round r ON r.id = g.round_id
+      WHERE r.competition_id = ? AND r.stage = 'GROUP'
+      ${g ? "AND r.group_id = ?" : "AND r.group_id IS NULL"}
+      AND (g.status <> 'NOT_STARTED' OR EXISTS (SELECT 1 FROM event e WHERE e.game_id = g.id))`;
+    if (get(db, sql, ...params).n) {
+      return fail(res, back, "Hay partidos ya jugados o con eventos en ese grupo; no se pueden regenerar los emparejamientos");
+    }
+  }
+
+  let created = 0;
+  for (const g of targets) {
+    const teams = g
+      ? all(db, "SELECT id FROM competition_team WHERE competition_id = ? AND group_id = ?", compId, g.id)
+      : all(db, "SELECT id FROM competition_team WHERE competition_id = ?", compId);
+    if (teams.length < 2) continue;
+    // Drop pending games and the now-empty group rounds before redrawing.
+    run(db, `DELETE FROM game WHERE id IN (
+        SELECT g2.id FROM game g2 JOIN round r ON r.id = g2.round_id
+        WHERE r.competition_id = ? AND r.stage = 'GROUP' ${g ? "AND r.group_id = ?" : "AND r.group_id IS NULL"} AND g2.status = 'NOT_STARTED')`,
+      ...(g ? [compId, g.id] : [compId]));
+    run(db, `DELETE FROM round WHERE competition_id = ? AND stage = 'GROUP'
+        ${g ? "AND group_id = ?" : "AND group_id IS NULL"}
+        AND NOT EXISTS (SELECT 1 FROM game g3 WHERE g3.round_id = round.id)`,
+      ...(g ? [compId, g.id] : [compId]));
+
+    const rounds = roundRobin(teams.map((t) => t.id), { doubleRound, random });
+    rounds.forEach((pairs, i) => {
+      const roundId = Number(run(db,
+        "INSERT INTO round (competition_id, group_id, stage, name, ordering) VALUES (?,?,?,?,?)",
+        compId, g ? g.id : null, "GROUP", `Jornada ${i + 1}`, i + 1).lastInsertRowid);
+      for (const [home, away] of pairs) {
+        const gameId = Number(run(db, "INSERT INTO game (round_id, status) VALUES (?, 'NOT_STARTED')", roundId).lastInsertRowid);
+        run(db, "INSERT INTO game_team (game_id, competition_team_id, team_type) VALUES (?,?,'HOME')", gameId, home);
+        run(db, "INSERT INTO game_team (game_id, competition_team_id, team_type) VALUES (?,?,'AWAY')", gameId, away);
+        created += 1;
+      }
+    });
+  }
+  if (!created) return fail(res, back, "No hay equipos suficientes en el grupo para sortear emparejamientos");
+  ok(res, back, `Sorteo generado: ${created} partidos creados`);
+});
+
+// Occupancy for the automatic planner, across every competition (teams and
+// pitches are global, so a team never doubles up on the same day anywhere).
+function scheduleOccupancy(tz) {
+  const busyTeams = new Map();
+  const busyPitches = new Map();
+  const rows = all(db, `SELECT g.id, g.game_date, g.pitch_id,
+      hct.team_id AS home_team, act.team_id AS away_team
+    FROM game g
+    JOIN game_team ht ON ht.game_id = g.id AND ht.team_type = 'HOME'
+    JOIN competition_team hct ON hct.id = ht.competition_team_id
+    JOIN game_team at ON at.game_id = g.id AND at.team_type = 'AWAY'
+    JOIN competition_team act ON act.id = at.competition_team_id
+    WHERE g.game_date IS NOT NULL AND g.status <> 'CANCELED'`);
+  for (const r of rows) {
+    const { date, time } = localParts(r.game_date, tz);
+    for (const t of [r.home_team, r.away_team]) {
+      if (!busyTeams.has(t)) busyTeams.set(t, new Map());
+      const m = busyTeams.get(t);
+      m.set(date, (m.get(date) || 0) + 1);
+    }
+    if (r.pitch_id) {
+      if (!busyPitches.has(r.pitch_id)) busyPitches.set(r.pitch_id, new Set());
+      busyPitches.get(r.pitch_id).add(`${date} ${time}`);
+    }
+  }
+  return { busyTeams, busyPitches };
+}
+
+// Assign dates, times and pitches to the unscheduled games of a competition.
+route("POST", "/admin/competitions/:id/fixtures/schedule", async (req, res, p) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  const compId = Number(p.id);
+  const back = `/admin/competitions/${compId}`;
+  const b = await readBody(req);
+  const comp = get(db, "SELECT * FROM competition WHERE id = ?", compId);
+  if (!comp) return redirect(res, "/admin/competitions");
+  if (!b.start_date) return fail(res, back, "Indica la fecha de inicio");
+  const tz = scopeFor(req).theme.timezone;
+  const pitchIds = (Array.isArray(b.pitches) ? b.pitches : b.pitches ? [b.pitches] : []).map(Number).filter(Boolean);
+  const slotMinutes = int(b.slot_minutes, comp.half_time * 2 + 15);
+
+  const games = all(db, `SELECT g.id, hct.team_id AS home, act.team_id AS away
+    FROM game g JOIN round r ON r.id = g.round_id
+    JOIN game_team ht ON ht.game_id = g.id AND ht.team_type = 'HOME'
+    JOIN competition_team hct ON hct.id = ht.competition_team_id
+    JOIN game_team at ON at.game_id = g.id AND at.team_type = 'AWAY'
+    JOIN competition_team act ON act.id = at.competition_team_id
+    WHERE r.competition_id = ? AND g.game_date IS NULL AND g.status = 'NOT_STARTED'
+    ORDER BY CASE r.stage WHEN 'GROUP' THEN 0 ELSE 1 END, r.ordering, r.id, g.id`, compId);
+  if (!games.length) return fail(res, back, "No hay partidos sin fecha en esta competición");
+
+  const { busyTeams, busyPitches } = scheduleOccupancy(tz);
+  const { assignments, unscheduled } = planSchedule(games, {
+    startDate: b.start_date,
+    fromTime: b.from_time || "18:00",
+    toTime: b.to_time || "23:00",
+    slotMinutes,
+    pitchIds,
+    busyTeams, busyPitches,
+    maxPerDayPerTeam: int(b.max_per_day, 1),
+  });
+  for (const a of assignments) {
+    run(db, "UPDATE game SET game_date = ?, pitch_id = ? WHERE id = ?",
+      localDateTimeToUtc(a.date, a.time, tz).toISOString(), a.pitchId, a.id);
+  }
+  const msg = `Horarios asignados a ${assignments.length} partidos`;
+  ok(res, back, unscheduled.length ? `${msg} (${unscheduled.length} no cupieron en el rango)` : msg);
+});
+
+// Seed a playoff round best-vs-worst. The first playoff round takes the
+// qualified teams (group winners + best runner-up); later rounds take the
+// winners of the previous playoff round, re-seeded by their group record.
+route("POST", "/admin/competitions/:id/bracket/seed", async (req, res, p) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  const compId = Number(p.id);
+  const back = `/admin/competitions/${compId}`;
+  const b = await readBody(req);
+  const roundId = int(b.round_id);
+  const round = get(db, "SELECT * FROM round WHERE id = ? AND competition_id = ? AND stage = 'PLAYOFF'", roundId, compId);
+  if (!round) return fail(res, back, "Elige una ronda de playoff válida");
+  if (get(db, "SELECT COUNT(*) n FROM game WHERE round_id = ?", roundId).n) {
+    return fail(res, back, "Esa ronda ya tiene partidos; elimínalos para resembrar los cruces");
+  }
+
+  const groupSeeds = computeGroupSeeds(db, compId);
+  const playoffRounds = all(db,
+    "SELECT * FROM round WHERE competition_id = ? AND stage = 'PLAYOFF' ORDER BY ordering, id", compId);
+  const idx = playoffRounds.findIndex((r) => r.id === roundId);
+  const playoffGames = repo.competitionGames(db, compId, { stage: "PLAYOFF" });
+
+  // Entrants of each round: the qualified teams for the first playoff round;
+  // afterwards the winners of the previous round plus whoever advanced with a
+  // bye (entrant without a game there).
+  let entrants = groupSeeds.filter((s) => s.qualified).map((s) => s.competition_team_id);
+  if (idx === 0 && entrants.length < 2) {
+    return fail(res, back, "Aún no hay clasificados suficientes en la fase de grupos");
+  }
+  for (let i = 0; i < idx; i++) {
+    const r = playoffRounds[i];
+    const games = playoffGames.filter((g) => g.round_id === r.id);
+    if (games.length === 0) {
+      return fail(res, back, `La ronda anterior (${r.name}) aún no tiene cruces; siémbrala primero`);
+    }
+    if (games.some((g) => g.status !== "FINISHED" || g.score_home === null || g.score_away === null)) {
+      return fail(res, back, `La ronda anterior (${r.name}) no está completa`);
+    }
+    const playing = new Set(games.flatMap((g) => [g.home_ct, g.away_ct]));
+    const winners = games.map((g) => {
+      const homeWins = g.score_home > g.score_away ||
+        (g.score_home === g.score_away && (g.penalty_score_home ?? -1) > (g.penalty_score_away ?? -1));
+      return homeWins ? g.home_ct : g.away_ct;
+    });
+    entrants = [...winners, ...entrants.filter((ct) => !playing.has(ct))];
+  }
+
+  const seeds = entrants
+    .map((ct) => groupSeeds.find((s) => s.competition_team_id === ct))
+    .filter(Boolean)
+    .sort((a, b) => a.seed - b.seed);
+  if (seeds.length < 2) return fail(res, back, "No hay suficientes equipos vivos para los cruces");
+
+  const { pairs, bye } = pairSeeds(seeds);
+  for (const [best, worst] of pairs) {
+    const gameId = Number(run(db, "INSERT INTO game (round_id, status) VALUES (?, 'NOT_STARTED')", roundId).lastInsertRowid);
+    run(db, "INSERT INTO game_team (game_id, competition_team_id, team_type) VALUES (?,?,'HOME')", gameId, best.competition_team_id);
+    run(db, "INSERT INTO game_team (game_id, competition_team_id, team_type) VALUES (?,?,'AWAY')", gameId, worst.competition_team_id);
+  }
+  ok(res, back, `Cruces creados en «${round.name}»: ${pairs.length} partidos${bye ? `, ${bye.team_name} pasa directo` : ""}`);
+});
+
+/* pitches -------------------------------------------------------------- */
+route("POST", "/admin/pitches/save", async (req, res) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  const b = await readBody(req);
+  const backTo = b.back || "/admin/competitions";
+  const name = String(b.name || "").trim();
+  if (!name) return fail(res, backTo, "El nombre de la cancha es obligatorio");
+  run(db, "INSERT INTO pitch (name, address) VALUES (?,?)", name, b.address ? String(b.address).trim() : null);
+  ok(res, backTo, "Cancha añadida");
+});
+route("POST", "/admin/pitches/:id/delete", async (req, res, p) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  const b = await readBody(req);
+  run(db, "DELETE FROM pitch WHERE id = ?", Number(p.id));
+  ok(res, b.back || "/admin/competitions", "Cancha eliminada");
 });
 
 /* games ---------------------------------------------------------------- */
+
+const GAMES_ADMIN_SELECT = `SELECT g.id, g.game_date, g.status, g.score_home, g.score_away,
+    ht.name home_name, at.name away_name, r.name round_name, r.stage, c.name competition_name
+  FROM game g
+  JOIN round r ON r.id=g.round_id JOIN competition c ON c.id=r.competition_id
+  JOIN game_team gh ON gh.game_id=g.id AND gh.team_type='HOME' JOIN competition_team hc ON hc.id=gh.competition_team_id JOIN team ht ON ht.id=hc.team_id
+  JOIN game_team ga ON ga.game_id=g.id AND ga.team_type='AWAY' JOIN competition_team ac ON ac.id=ga.competition_team_id JOIN team at ON at.id=ac.team_id`;
+
+function roundsForFilter(competitionId) {
+  if (competitionId) return repo.roundsForCompetition(db, competitionId);
+  return all(db, `SELECT r.*, c.name AS competition_name FROM round r JOIN competition c ON c.id=r.competition_id
+    ORDER BY c.id, CASE r.stage WHEN 'GROUP' THEN 0 ELSE 1 END, r.ordering, r.id`);
+}
+
 route("GET", "/admin/games", (req, res) => {
   const user = requireAdmin(req, res); if (!user) return;
   const url = new URL(req.url, "http://x");
-  const competitions = repo.leagueCompetitions(db).concat(repo.cupCompetitions(db));
   const competitionId = url.searchParams.get("competition") || "";
   const status = url.searchParams.get("status") || "";
+  const stage = url.searchParams.get("stage") || "";
   const roundId = url.searchParams.get("round") || "";
   const params = [];
-  let sql = `SELECT g.id, g.game_date, g.status, g.score_home, g.score_away,
-      ht.name home_name, at.name away_name, c.name competition_name
-    FROM game g
-    JOIN round r ON r.id=g.round_id JOIN competition c ON c.id=r.competition_id
-    JOIN game_team gh ON gh.game_id=g.id AND gh.team_type='HOME' JOIN competition_team hc ON hc.id=gh.competition_team_id JOIN team ht ON ht.id=hc.team_id
-    JOIN game_team ga ON ga.game_id=g.id AND ga.team_type='AWAY' JOIN competition_team ac ON ac.id=ga.competition_team_id JOIN team at ON at.id=ac.team_id
-    WHERE 1=1`;
+  let sql = `${GAMES_ADMIN_SELECT} WHERE 1=1`;
   if (competitionId) { sql += " AND r.competition_id = ?"; params.push(Number(competitionId)); }
+  if (stage) { sql += " AND r.stage = ?"; params.push(stage); }
   if (status) { sql += " AND g.status = ?"; params.push(status); }
   if (roundId) { sql += " AND g.round_id = ?"; params.push(Number(roundId)); }
   sql += " ORDER BY g.game_date DESC LIMIT 200";
   sendHtml(res, admin.adminGamesView(scopeFor(req), {
-    games: all(db, sql, ...params), competitions, competitionId, status, roundId, user, query: queryObject(url),
+    games: all(db, sql, ...params),
+    competitions: repo.competitions(db),
+    competitionId, status, stage, roundId,
+    rounds: roundsForFilter(competitionId ? Number(competitionId) : null),
+    user, query: queryObject(url),
   }));
 });
+route("GET", "/admin/games/new", (req, res) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  const url = new URL(req.url, "http://x");
+  const competitions = repo.competitions(db);
+  const competitionId = Number(url.searchParams.get("competition") || competitions[0]?.id || 0) || null;
+  sendHtml(res, admin.adminGameFormView(scopeFor(req), {
+    competitions,
+    competitionId,
+    rounds: competitionId ? repo.roundsForCompetition(db, competitionId) : [],
+    teams: competitionId ? repo.competitionTeams(db, competitionId) : [],
+    pitches: all(db, "SELECT * FROM pitch ORDER BY name"),
+    user, query: queryObject(url),
+  }));
+});
+// Interval-overlap conflicts for a manually placed game: same pitch or the
+// same team already playing inside the match window (2 halves + 10' break).
+function schedulingConflicts({ gameId = null, gameDate, pitchId, homeCt, awayCt, durationMin, tz }) {
+  if (!gameDate) return [];
+  const start = new Date(gameDate).getTime();
+  const end = start + durationMin * 60000;
+  const rows = all(db, `SELECT g.id, g.game_date, g.pitch_id,
+      hct.team_id AS home_team, act.team_id AS away_team,
+      tht.name AS home_name, tat.name AS away_name
+    FROM game g
+    JOIN game_team ht ON ht.game_id = g.id AND ht.team_type = 'HOME'
+    JOIN competition_team hct ON hct.id = ht.competition_team_id
+    JOIN team tht ON tht.id = hct.team_id
+    JOIN game_team at ON at.game_id = g.id AND at.team_type = 'AWAY'
+    JOIN competition_team act ON act.id = at.competition_team_id
+    JOIN team tat ON tat.id = act.team_id
+    WHERE g.game_date IS NOT NULL AND g.status <> 'CANCELED'${gameId ? " AND g.id <> ?" : ""}`,
+    ...(gameId ? [gameId] : []));
+  const teamIds = all(db, "SELECT id, team_id FROM competition_team WHERE id IN (?,?)", homeCt, awayCt)
+    .map((r) => r.team_id);
+  const conflicts = [];
+  for (const r of rows) {
+    const s2 = new Date(r.game_date).getTime();
+    if (s2 >= end || s2 + durationMin * 60000 <= start) continue;
+    const label = `${r.home_name} vs ${r.away_name} (${localParts(r.game_date, tz).date} ${localParts(r.game_date, tz).time})`;
+    if (pitchId && r.pitch_id === pitchId) conflicts.push(`la cancha ya está ocupada por ${label}`);
+    if (teamIds.includes(r.home_team) || teamIds.includes(r.away_team)) conflicts.push(`un equipo ya juega en ese horario: ${label}`);
+  }
+  return conflicts;
+}
+
+route("POST", "/admin/games/create", async (req, res) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  const b = await readBody(req);
+  const competitionId = int(b.competition_id);
+  const roundId = int(b.round_id);
+  const homeCt = int(b.home_ct);
+  const awayCt = int(b.away_ct);
+  const back = competitionId ? `/admin/games/new?competition=${competitionId}` : "/admin/games/new";
+  if (!roundId || !homeCt || !awayCt) return fail(res, back, "Elige jornada y los dos equipos");
+  if (homeCt === awayCt) return fail(res, back, "El local y el visitante deben ser distintos");
+  const round = get(db, "SELECT * FROM round WHERE id = ? AND competition_id = ?", roundId, competitionId);
+  if (!round) return fail(res, back, "La jornada no pertenece a esa competición");
+  const sides = all(db, "SELECT id FROM competition_team WHERE competition_id = ? AND id IN (?,?)", competitionId, homeCt, awayCt);
+  if (sides.length < 2) return fail(res, back, "Los equipos deben pertenecer a la competición");
+  try {
+    const tz = scopeFor(req).theme.timezone;
+    const gameDate = b.date ? localDateTimeToUtc(b.date, b.time || "00:00", tz).toISOString() : null;
+    if (gameDate) {
+      const comp = get(db, "SELECT half_time FROM competition WHERE id = ?", competitionId);
+      const conflicts = schedulingConflicts({ gameDate, pitchId: int(b.pitch_id), homeCt, awayCt, durationMin: (comp?.half_time ?? 10) * 2 + 10, tz });
+      if (conflicts.length) return fail(res, back, `Conflicto de calendario: ${conflicts[0]}`);
+    }
+    const gameId = Number(run(db, "INSERT INTO game (round_id, pitch_id, game_date, status, code) VALUES (?,?,?, 'NOT_STARTED', ?)",
+      roundId, int(b.pitch_id), gameDate, b.code || null).lastInsertRowid);
+    run(db, "INSERT INTO game_team (game_id, competition_team_id, team_type) VALUES (?,?,'HOME')", gameId, homeCt);
+    run(db, "INSERT INTO game_team (game_id, competition_team_id, team_type) VALUES (?,?,'AWAY')", gameId, awayCt);
+    ok(res, `/admin/games/${gameId}`, "Partido creado");
+  } catch (e) {
+    fail(res, back, e.message);
+  }
+});
+
 function gameData(gameId) {
   const game = repo.gameById(db, gameId);
   if (!game) return null;
@@ -579,7 +1033,51 @@ route("GET", "/admin/games/:id", (req, res, p) => {
   const user = requireAdmin(req, res); if (!user) return;
   const data = gameData(Number(p.id));
   if (!data) return redirect(res, "/admin/games");
-  sendHtml(res, admin.adminGameEditView(scopeFor(req), { ...data, user, query: queryObject(new URL(req.url, "http://x")) }));
+  const competitionId = data.game.competition_id;
+  sendHtml(res, admin.adminGameEditView(scopeFor(req), {
+    ...data,
+    rounds: repo.roundsForCompetition(db, competitionId),
+    teams: repo.competitionTeams(db, competitionId),
+    pitches: all(db, "SELECT * FROM pitch ORDER BY name"),
+    user, query: queryObject(new URL(req.url, "http://x")),
+  }));
+});
+route("POST", "/admin/games/:id/organize", async (req, res, p) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  const gameId = Number(p.id);
+  const game = get(db, "SELECT * FROM game WHERE id = ?", gameId);
+  if (!game) return redirect(res, "/admin/games");
+  const b = await readBody(req);
+  const roundId = int(b.round_id);
+  const homeCt = int(b.home_ct);
+  const awayCt = int(b.away_ct);
+  if (roundId) run(db, "UPDATE game SET round_id = ? WHERE id = ?", roundId, gameId);
+  if (homeCt && awayCt) {
+    if (homeCt === awayCt) return fail(res, `/admin/games/${gameId}`, "El local y el visitante deben ser distintos");
+    run(db, "DELETE FROM game_team WHERE game_id = ?", gameId);
+    run(db, "INSERT INTO game_team (game_id, competition_team_id, team_type) VALUES (?,?,'HOME')", gameId, homeCt);
+    run(db, "INSERT INTO game_team (game_id, competition_team_id, team_type) VALUES (?,?,'AWAY')", gameId, awayCt);
+  }
+  const tz = scopeFor(req).theme.timezone;
+  const gameDate = b.date ? localDateTimeToUtc(b.date, b.time || "00:00", tz).toISOString() : null;
+  if (gameDate) {
+    const current = repo.gameById(db, gameId);
+    const comp = get(db, "SELECT half_time FROM competition WHERE id = ?", current.competition_id);
+    const conflicts = schedulingConflicts({
+      gameId, gameDate, pitchId: int(b.pitch_id),
+      homeCt: homeCt || current.home_ct, awayCt: awayCt || current.away_ct,
+      durationMin: (comp?.half_time ?? 10) * 2 + 10, tz,
+    });
+    if (conflicts.length) return fail(res, `/admin/games/${gameId}`, `Conflicto de calendario: ${conflicts[0]}`);
+  }
+  run(db, "UPDATE game SET pitch_id=?, code=?, game_date=COALESCE(?, game_date) WHERE id=?",
+    int(b.pitch_id), b.code || null, gameDate, gameId);
+  ok(res, `/admin/games/${gameId}`, "Partido reorganizado");
+});
+route("POST", "/admin/games/:id/delete", (req, res, p) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  run(db, "DELETE FROM game WHERE id = ?", Number(p.id));
+  ok(res, "/admin/games", "Partido eliminado");
 });
 route("POST", "/admin/games/:id/save", async (req, res, p) => {
   const user = requireAdmin(req, res); if (!user) return;
@@ -587,60 +1085,121 @@ route("POST", "/admin/games/:id/save", async (req, res, p) => {
   const gameId = Number(p.id);
   const scoreHome = b.score_home === "" ? null : Number(b.score_home);
   const scoreAway = b.score_away === "" ? null : Number(b.score_away);
-  run(db, `UPDATE game SET score_home=?, score_away=?, penalty_score_home=?, penalty_score_away=?, status=?,
-      code=?, game_date=COALESCE(?, game_date) WHERE id=?`,
+  run(db, `UPDATE game SET score_home=?, score_away=?, penalty_score_home=?, penalty_score_away=?, status=? WHERE id=?`,
     scoreHome, scoreAway,
     b.penalty_score_home === "" ? null : Number(b.penalty_score_home),
     b.penalty_score_away === "" ? null : Number(b.penalty_score_away),
-    b.status || "NOT_STARTED", b.code || null,
-    b.game_date ? new Date(b.game_date).toISOString() : null, gameId);
+    b.status || "NOT_STARTED", gameId);
   if (b.status === "FINISHED") countGameStats(gameId);
-  redirect(res, `/admin/games/${gameId}?ok=Resultado%20guardado`);
+  ok(res, `/admin/games/${gameId}`, "Resultado guardado");
 });
 route("POST", "/admin/games/:id/events", async (req, res, p) => {
   const user = requireAdmin(req, res); if (!user) return;
   const b = await readBody(req);
   const gameId = Number(p.id);
   const cpId = Number(b.competition_player_id);
-  if (!cpId) return redirect(res, `/admin/games/${gameId}?err=Elige%20un%20jugador`);
+  if (!cpId) return fail(res, `/admin/games/${gameId}`, "Elige un jugador");
   addEvent(gameId, cpId, Number(b.event_type_id), Number(b.time) || 1);
-  redirect(res, `/admin/games/${gameId}?ok=Evento%20a%C3%B1adido`);
+  if (wantsJson(req)) return sendJson(res, liveBody(gameId));
+  ok(res, `/admin/games/${gameId}`, "Evento añadido");
 });
 route("POST", "/admin/games/:id/events/:eventId/delete", (req, res, p) => {
   const user = requireAdmin(req, res); if (!user) return;
   deleteEvent(Number(p.id), Number(p.eventId));
-  redirect(res, `/admin/games/${p.id}?ok=Evento%20eliminado`);
+  if (wantsJson(req)) return sendJson(res, liveBody(Number(p.id)));
+  ok(res, `/admin/games/${p.id}`, "Evento eliminado");
+});
+route("POST", "/admin/games/:id/status", async (req, res, p) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  const b = await readBody(req);
+  const gameId = Number(p.id);
+  const status = ["NOT_STARTED", "STARTED", "BREAK", "FINISHED", "CANCELED"].includes(b.status) ? b.status : "STARTED";
+  if (status === "FINISHED") {
+    const g = get(db, "SELECT score_home, score_away FROM game WHERE id = ?", gameId);
+    if (g.score_home === null || g.score_away === null) recomputeScore(gameId);
+    countGameStats(gameId);
+  }
+  run(db, "UPDATE game SET status = ? WHERE id = ?", status, gameId);
+  if (wantsJson(req)) return sendJson(res, liveBody(gameId));
+  ok(res, `/admin/games/${gameId}`, "Estado actualizado");
+});
+route("POST", "/admin/games/:id/squad", async (req, res, p) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  const b = await readBody(req);
+  const gameId = Number(p.id);
+  const wanted = new Set([].concat(b.player || []).map(Number));
+  const existing = all(db, "SELECT id, competition_player_id FROM game_player WHERE game_id = ?", gameId);
+  const present = new Set(existing.map((row) => row.competition_player_id));
+  for (const row of existing) {
+    if (wanted.has(row.competition_player_id)) continue;
+    const hasEvents = get(db, "SELECT COUNT(*) n FROM event WHERE game_player_id = ?", row.id).n;
+    if (!hasEvents) run(db, "DELETE FROM game_player WHERE id = ?", row.id);
+  }
+  for (const cpId of wanted) {
+    if (present.has(cpId)) continue;
+    const row = get(db, "SELECT squad_number FROM competition_player WHERE id = ?", cpId);
+    run(db, "INSERT OR IGNORE INTO game_player (game_id, competition_player_id, squad_number) VALUES (?,?,?)", gameId, cpId, row?.squad_number ?? null);
+  }
+  ok(res, `/admin/games/${gameId}`, "Convocatoria guardada");
 });
 
-/* messages + settings -------------------------------------------------- */
-route("GET", "/admin/messages", (req, res) => {
+/* live state ----------------------------------------------------------- */
+route("GET", "/api/games/:id/live", (req, res, p) => {
+  const body = liveBody(Number(p.id));
+  sendJson(res, body || { error: "not_found" }, body ? 200 : 404);
+});
+
+/* sponsors ------------------------------------------------------------- */
+route("GET", "/admin/sponsors", (req, res) => {
   const user = requireAdmin(req, res); if (!user) return;
-  sendHtml(res, admin.messagesView(scopeFor(req), {
-    messages: all(db, "SELECT * FROM contact_message ORDER BY created_at DESC"), user, query: queryObject(new URL(req.url, "http://x")),
+  sendHtml(res, admin.sponsorsView(scopeFor(req), {
+    sponsors: repo.allSponsors(db), user, query: queryObject(new URL(req.url, "http://x")),
   }));
 });
-route("POST", "/admin/messages/:id/read", (req, res, p) => {
+route("POST", "/admin/sponsors/save", async (req, res) => {
   const user = requireAdmin(req, res); if (!user) return;
-  run(db, "UPDATE contact_message SET read = 1 WHERE id = ?", Number(p.id));
-  redirect(res, "/admin/messages?ok=Mensaje%20marcado%20como%20le%C3%ADdo");
+  const b = await readBody(req);
+  const name = String(b.name || "").trim();
+  if (!name) return fail(res, "/admin/sponsors", "El nombre es obligatorio");
+  const logoUrl = b.logo_url ? String(b.logo_url).trim() : null;
+  const linkUrl = b.link_url ? String(b.link_url).trim() : null;
+  const ordering = int(b.ordering, 0);
+  const active = b.active ? 1 : 0;
+  try {
+    if (b.id) {
+      run(db, "UPDATE sponsor SET name=?, logo_url=?, link_url=?, ordering=?, active=? WHERE id=?",
+        name, logoUrl, linkUrl, ordering, active, Number(b.id));
+    } else {
+      run(db, "INSERT INTO sponsor (name, logo_url, link_url, ordering, active) VALUES (?,?,?,?,1)",
+        name, logoUrl, linkUrl, ordering);
+    }
+    ok(res, "/admin/sponsors", "Patrocinador guardado");
+  } catch (e) {
+    fail(res, "/admin/sponsors", e.message);
+  }
 });
+route("POST", "/admin/sponsors/:id/delete", (req, res, p) => {
+  const user = requireAdmin(req, res); if (!user) return;
+  run(db, "DELETE FROM sponsor WHERE id = ?", Number(p.id));
+  ok(res, "/admin/sponsors", "Patrocinador eliminado");
+});
+
+/* settings ------------------------------------------------------------- */
 route("GET", "/admin/settings", (req, res) => {
   const user = requireAdmin(req, res); if (!user) return;
   sendHtml(res, admin.settingsView(scopeFor(req), {
     org: get(db, "SELECT * FROM organization LIMIT 1"),
-    sponsors: repo.sponsors(db),
-    contactFields: all(db, "SELECT * FROM contact_field ORDER BY id"),
     user, query: queryObject(new URL(req.url, "http://x")),
   }));
 });
 route("POST", "/admin/settings/save", async (req, res) => {
   const user = requireAdmin(req, res); if (!user) return;
   const b = await readBody(req);
-  run(db, `UPDATE organization SET name=?, contact_email=?, primary_color=?, secondary_color=?,
+  run(db, `UPDATE organization SET name=?, primary_color=?, secondary_color=?,
       background_accent_color=?, socials_json=? WHERE id = (SELECT id FROM organization LIMIT 1)`,
-    b.name, b.contact_email || null, b.primary_color, b.secondary_color, b.background_accent_color,
+    b.name, b.primary_color, b.secondary_color, b.background_accent_color,
     JSON.stringify({ facebook: b.social_facebook_url, instagram: b.social_instagram_url, youtube: b.social_youtube_url }));
-  redirect(res, "/admin/settings?ok=Ajustes%20guardados");
+  ok(res, "/admin/settings", "Ajustes guardados");
 });
 
 /* ============================== referee routes ========================== */
@@ -682,7 +1241,6 @@ function recomputeScore(gameId) {
   const teams = all(db, "SELECT competition_team_id, team_type FROM game_team WHERE game_id = ?", gameId);
   const home = teams.find((t) => t.team_type === "HOME")?.competition_team_id;
   const away = teams.find((t) => t.team_type === "AWAY")?.competition_team_id;
-  const side = new Map([[home, "home"], [away, "away"]]);
   let hs = 0, as = 0;
   for (const e of events) {
     let scorer = e.team_ct;
@@ -730,30 +1288,30 @@ route("POST", "/referee/game/:id/status", async (req, res, p) => {
     countGameStats(gameId);
   }
   run(db, "UPDATE game SET status = ? WHERE id = ?", status, gameId);
-  redirect(res, `/referee/game/${gameId}?ok=Estado%20actualizado`);
+  ok(res, `/referee/game/${gameId}`, "Estado actualizado");
 });
 route("POST", "/referee/game/:id/score", async (req, res, p) => {
   const user = requireStaff(req, res); if (!user) return;
   const b = await readBody(req);
   run(db, "UPDATE game SET score_home=?, score_away=? WHERE id=?",
     Number(b.score_home) || 0, Number(b.score_away) || 0, Number(p.id));
-  redirect(res, `/referee/game/${p.id}?ok=Marcador%20corregido`);
+  ok(res, `/referee/game/${p.id}`, "Marcador corregido");
 });
 route("POST", "/referee/game/:id/events", async (req, res, p) => {
   const user = requireStaff(req, res); if (!user) return;
   const b = await readBody(req);
   const value = String(b.submit || "");
   const [teamCt, cpId] = value.split(":").map(Number);
-  if (!teamCt || !cpId) return redirect(res, `/referee/game/${p.id}?err=Elige%20un%20jugador`);
+  if (!teamCt || !cpId) return fail(res, `/referee/game/${p.id}`, "Elige un jugador");
   const typeId = Number(b.event_type_id);
   const minute = Math.max(1, Math.min(120, Number(b.time) || 1));
   addEvent(Number(p.id), cpId, typeId, minute);
-  redirect(res, `/referee/game/${p.id}?ok=Evento%20registrado`);
+  ok(res, `/referee/game/${p.id}`, "Evento registrado");
 });
 route("POST", "/referee/game/:id/events/:eventId/delete", (req, res, p) => {
   const user = requireStaff(req, res); if (!user) return;
   deleteEvent(Number(p.id), Number(p.eventId));
-  redirect(res, `/referee/game/${p.id}?ok=Evento%20eliminado`);
+  ok(res, `/referee/game/${p.id}`, "Evento eliminado");
 });
 route("POST", "/referee/game/:id/squad", async (req, res, p) => {
   const user = requireStaff(req, res); if (!user) return;
@@ -772,7 +1330,7 @@ route("POST", "/referee/game/:id/squad", async (req, res, p) => {
     const row = get(db, "SELECT squad_number FROM competition_player WHERE id = ?", cpId);
     run(db, "INSERT OR IGNORE INTO game_player (game_id, competition_player_id, squad_number) VALUES (?,?,?)", gameId, cpId, row?.squad_number ?? null);
   }
-  redirect(res, `/referee/game/${gameId}?ok=Convocatoria%20guardada`);
+  ok(res, `/referee/game/${gameId}`, "Convocatoria guardada");
 });
 
 /* ------------------------------------------------------------------ home */
@@ -786,7 +1344,7 @@ route("GET", "/:lang", (req, res) => sendHtml(res, views.homeView(scopeFor(req))
 async function handler(req, res) {
   try {
     const url = new URL(req.url, "http://localhost");
-    if (req.method === "GET" && (url.pathname === "/styles.css" || url.pathname === "/referee.js" || url.pathname === "/admin.js")) {
+    if (req.method === "GET" && (url.pathname === "/styles.css" || url.pathname === "/live.js" || url.pathname === "/referee.js")) {
       if (await serveStatic(req, res, url.pathname)) return;
     }
     if (req.method === "GET" && url.pathname.startsWith("/public/")) {
@@ -795,7 +1353,7 @@ async function handler(req, res) {
     const found = matchRoute(req.method, url.pathname);
     if (found) return await found.handler(req, res, found.params);
     // Language-less public paths are redirected to /es for convenience.
-    const legacy = ["/league-menu", "/tournament-menu", "/calendar", "/contact", "/gallery", "/news"];
+    const legacy = ["/competitions", "/calendar", "/archive", "/competition"];
     if (legacy.some((p) => url.pathname.startsWith(p))) return redirect(res, `/es${url.pathname}${url.search}`);
     sendHtml(res, views.notFoundView(scopeFor(req)), 404);
   } catch (error) {
@@ -808,8 +1366,8 @@ async function handler(req, res) {
 }
 
 createServer(handler).listen(PORT, HOST, () => {
-  console.log(`FLM clone running at http://${HOST}:${PORT}`);
-  console.log(`  Public site : http://${HOST}:${PORT}/es`);
-  console.log(`  Admin       : http://${HOST}:${PORT}/admin  (admin@aquaopen.local / Admin123!)`);
-  console.log(`  Referee     : http://${HOST}:${PORT}/referee  (referee@aquaopen.local / Referee123!)`);
+  console.log(`LIGAS running at http://${HOST}:${PORT}`);
+  console.log(`  Sitio público : http://${HOST}:${PORT}/es`);
+  console.log(`  Admin         : http://${HOST}:${PORT}/admin`);
+  console.log(`  Árbitro       : http://${HOST}:${PORT}/referee`);
 });

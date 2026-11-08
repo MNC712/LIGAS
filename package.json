@@ -1,17 +1,15 @@
 {
-  "name": "flm-clone",
+  "name": "ligas",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Local recreation of the FLM System league management product, built from observed public behaviour.",
+  "description": "Gestor de ligas de fútbol sala: sitio público, panel de administración y app de árbitro, sin dependencias de runtime.",
   "engines": { "node": ">=22.5" },
   "scripts": {
-    "harvest": "node scripts/harvest.mjs",
-    "seed": "node src/seed.mjs",
+    "reset": "node scripts/reset.mjs",
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",
     "test": "node --test test/",
-    "smoke": "node scripts/smoke.mjs",
-    "verify": "node scripts/inspect.mjs"
+    "smoke": "node scripts/smoke.mjs"
   }
 }

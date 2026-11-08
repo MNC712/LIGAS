@@ -47,6 +47,7 @@ export const icons = {
   users: (p) => svg(`<circle cx="9" cy="8" r="3"/><path d="M3 20a6 6 0 0 1 12 0"/><path d="M16 5a3 3 0 0 1 0 6M17 20a5.5 5.5 0 0 0-2-4"/>`, p),
   chart: (p) => svg(`<path d="M4 20h16M7 16v-5M12 16V6M17 16v-8"/>`, p),
   whistle: (p) => svg(`<path d="M14 8h7v5a6 6 0 0 1-6 6H9a6 6 0 0 1 0-12h5"/><circle cx="6" cy="13" r="3"/>`, p),
+  star: (p) => svg(`<path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>`, p),
 };
 
 /* --------------------------------------------------------------- fragments */
@@ -94,15 +95,13 @@ export function stat(value, label) {
 export function layout({
   org, theme, lang = "es", title, description, body, active = "",
   banner = null, tabs = null, scripts = [], bodyClass = "",
+  sponsors = [],
 }) {
   const socials = (() => { try { return JSON.parse(org.socials_json || "{}"); } catch { return {}; } })();
   const nav = [
-    { href: `/es/tournaments`, label: "Torneos", key: "tournaments" },
-    { href: `/es/league`, label: "Liga", key: "league" },
+    { href: `/es/competitions`, label: "Competiciones", key: "competitions" },
     { href: `/es/calendar`, label: "Calendario", key: "calendar" },
-    { href: `/es/contact`, label: "Contacto", key: "contact" },
-    { href: `/es/gallery`, label: "Galería", key: "gallery" },
-    { href: `/es/league-menu/seasons-archive`, label: "Archivo", key: "archive" },
+    { href: `/es/archive`, label: "Archivo", key: "archive" },
   ];
   const css = `
     :root{
@@ -168,10 +167,11 @@ ${tabs}
       ${socials.youtube ? html`<a href="${socials.youtube}" target="_blank" rel="noopener">YouTube</a>` : html``}
     </div>
   </div>
-  <div class="footer-note">
-    <p>Recreación local con fines de estudio, construida únicamente a partir del sitio público de la liga y su API GraphQL pública.
-      Datos de origen: <a href="https://${org.domain}" target="_blank" rel="noopener">${org.domain}</a>.</p>
-  </div>
+  ${sponsors.length > 0 ? html`<div class="footer-sponsors">
+    ${sponsors.map((s) => html`<a href="${s.link_url || "#"}" target="_blank" rel="noopener" class="footer-sponsor"${s.logo_url ? "" : ` data-text="${s.name}"`}>
+      ${s.logo_url ? html`<img src="${s.logo_url}" alt="${s.name}" loading="lazy" />` : html`<span>${s.name}</span>`}
+    </a>`)}
+  </div>` : ""}
 </footer>
 ${scripts.map((s) => html`<script src="${s}" defer></script>`)}
 </body>
@@ -195,7 +195,7 @@ export function pageBanner({ org, title, chip, subtitle, aside }) {
 }
 
 export function tabsNav(items) {
-  return html`<div class="tabs-wrap"><nav class="tabs" aria-label="Section">${items.map((t) =>
+  return html`<div class="tabs-wrap"><nav class="tabs" aria-label="Sección">${items.map((t) =>
     html`<a class="tab${t.active ? " is-active" : ""}" href="${t.href}">${t.label}</a>`)}</nav></div>`;
 }
 

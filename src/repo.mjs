@@ -3,9 +3,9 @@ import { all, get } from "./db.mjs";
 
 const GAME_SELECT = `
   SELECT g.id, g.game_date, g.status, g.score_home, g.score_away,
-         g.penalty_score_home, g.penalty_score_away, g.code, g.about, g.video,
-         r.id AS round_id, r.name AS round_name, r.cup_phase, r.cup_bracket,
-         r.competition_id,
+         g.penalty_score_home, g.penalty_score_away, g.code, g.pitch_id,
+         r.id AS round_id, r.name AS round_name, r.stage, r.group_id,
+         cg.name AS group_name, r.competition_id,
          ht.competition_team_id AS home_ct, hteam.name AS home_name, hteam.slug AS home_slug,
          hteam.crest_url AS home_crest, hteam.name_short AS home_short,
          at.competition_team_id AS away_ct, ateam.name AS away_name, ateam.slug AS away_slug,
@@ -13,6 +13,7 @@ const GAME_SELECT = `
          p.name AS pitch_name, p.address AS pitch_address, p.city AS pitch_city
     FROM game g
     JOIN round r ON r.id = g.round_id
+    LEFT JOIN competition_group cg ON cg.id = r.group_id
     JOIN game_team ht ON ht.game_id = g.id AND ht.team_type = 'HOME'
     JOIN game_team at ON at.game_id = g.id AND at.team_type = 'AWAY'
     JOIN competition_team hct ON hct.id = ht.competition_team_id
@@ -21,13 +22,24 @@ const GAME_SELECT = `
     JOIN team ateam ON ateam.id = act.team_id
     LEFT JOIN pitch p ON p.id = g.pitch_id`;
 
-export function competitionGames(db, competitionId, { status = null, order = "DESC", limit = null, offset = 0 } = {}) {
+export function competitionGames(db, competitionId, { status = null, order = "DESC", limit = null, offset = 0, stage = null, groupId = null } = {}) {
   const params = [competitionId];
   let sql = `${GAME_SELECT} WHERE r.competition_id = ?`;
   if (status) { sql += " AND g.status = ?"; params.push(status); }
-  sql += ` ORDER BY g.game_date ${order}, r.id ${order}, g.id ${order}`;
+  if (stage) { sql += " AND r.stage = ?"; params.push(stage); }
+  if (groupId !== null) { sql += " AND r.group_id = ?"; params.push(groupId); }
+  sql += ` ORDER BY g.game_date ${order}, r.ordering ${order}, r.id ${order}, g.id ${order}`;
   if (limit !== null) { sql += " LIMIT ? OFFSET ?"; params.push(limit, offset); }
   return all(db, sql, ...params);
+}
+
+export function liveGames(db, competitionId) {
+  return all(
+    db,
+    `${GAME_SELECT} WHERE r.competition_id = ? AND g.status IN ('STARTED','BREAK')
+      ORDER BY g.game_date ASC, g.id ASC`,
+    competitionId
+  );
 }
 
 export function countCompetitionGames(db, competitionId, status = null) {
@@ -51,14 +63,43 @@ export function gamesForTeam(db, competitionId, teamId, { status = null, limit =
   return all(db, sql, ...params);
 }
 
+// Group-stage rounds first (by their group and ordering), then playoff rounds.
 export function roundsForCompetition(db, competitionId) {
-  return all(db, "SELECT * FROM round WHERE competition_id = ? ORDER BY id", competitionId);
+  return all(
+    db,
+    `SELECT r.*, cg.name AS group_name,
+        (SELECT COUNT(*) FROM game g WHERE g.round_id = r.id) AS games,
+        (SELECT COUNT(*) FROM game g WHERE g.round_id = r.id AND g.status = 'FINISHED') AS finished
+       FROM round r LEFT JOIN competition_group cg ON cg.id = r.group_id
+      WHERE r.competition_id = ?
+      ORDER BY CASE r.stage WHEN 'GROUP' THEN 0 ELSE 1 END, r.ordering, r.id`,
+    competitionId
+  );
+}
+
+export function groupsForCompetition(db, competitionId) {
+  return all(
+    db,
+    `SELECT cg.*, (SELECT COUNT(*) FROM competition_team ct WHERE ct.group_id = cg.id) AS teams
+       FROM competition_group cg WHERE cg.competition_id = ? ORDER BY cg.ordering, cg.id`,
+    competitionId
+  );
+}
+
+export function competitionTeams(db, competitionId) {
+  return all(
+    db,
+    `SELECT ct.id AS competition_team_id, ct.group_id, t.id AS team_id, t.name, t.slug, t.crest_url
+       FROM competition_team ct JOIN team t ON t.id = ct.team_id
+      WHERE ct.competition_id = ? ORDER BY t.name`,
+    competitionId
+  );
 }
 
 export function competitionTeamBySlug(db, competitionId, teamSlug) {
   return get(
     db,
-    `SELECT ct.id AS competition_team_id, ct.competition_id, t.*
+    `SELECT ct.id AS competition_team_id, ct.competition_id, ct.group_id, t.*
        FROM competition_team ct JOIN team t ON t.id = ct.team_id
       WHERE ct.competition_id = ? AND t.slug = ?`,
     competitionId, teamSlug
@@ -107,6 +148,18 @@ export function gameEvents(db, gameId) {
   );
 }
 
+// Everything needed to draw a live scoreboard: the match row plus its events.
+export function liveSnapshot(db, gameId) {
+  const game = get(
+    db,
+    `SELECT id, status, score_home, score_away, penalty_score_home, penalty_score_away
+       FROM game WHERE id = ?`,
+    gameId
+  );
+  if (!game) return null;
+  return { game, events: gameEvents(db, gameId) };
+}
+
 export function playerSeasonGameLog(db, competitionId, playerId) {
   return all(
     db,
@@ -136,51 +189,37 @@ export function playerSeasonGameLog(db, competitionId, playerId) {
   );
 }
 
-export function sponsors(db) {
-  return all(db, "SELECT * FROM sponsor ORDER BY id");
-}
-
-export function galleryImages(db) {
-  const org = get(db, "SELECT gallery_json FROM organization LIMIT 1");
-  try { return JSON.parse(org?.gallery_json || "[]"); } catch { return []; }
-}
-
-export function posts(db) {
-  return all(db, "SELECT * FROM post ORDER BY created_at DESC");
-}
-
-export function postBySlug(db, slug) {
-  return get(db, "SELECT * FROM post WHERE slug = ?", slug);
-}
-
 export function seasons(db) {
   return all(db, "SELECT * FROM season ORDER BY start_date DESC");
 }
 
-export function leagueCompetitions(db) {
-  return all(
-    db,
-    `SELECT c.*, l.slug AS league_slug, l.name AS league_name, s.slug AS season_slug, s.name AS season_name
-       FROM competition c LEFT JOIN league l ON l.id = c.league_id
-       LEFT JOIN season s ON s.id = c.season_id
-      WHERE c.type = 'LEAGUE' ORDER BY c.id`
-  );
+export function activeSponsors(db) {
+  return all(db, "SELECT * FROM sponsor WHERE active = 1 ORDER BY ordering, id");
 }
 
-export function cupCompetitions(db) {
+export function allSponsors(db) {
+  return all(db, "SELECT * FROM sponsor ORDER BY ordering, id");
+}
+
+export function competitions(db) {
   return all(
     db,
-    `SELECT c.*, s.slug AS season_slug, s.name AS season_name
+    `SELECT c.*, s.slug AS season_slug, s.name AS season_name,
+        (SELECT COUNT(*) FROM competition_team ct WHERE ct.competition_id = c.id) AS teams,
+        (SELECT COUNT(*) FROM competition_group cg WHERE cg.competition_id = c.id) AS groups_count,
+        (SELECT COUNT(*) FROM round r WHERE r.competition_id = c.id AND r.stage = 'GROUP') AS group_rounds,
+        (SELECT COUNT(*) FROM round r WHERE r.competition_id = c.id AND r.stage = 'PLAYOFF') AS playoff_rounds,
+        (SELECT COUNT(*) FROM game g JOIN round r ON r.id = g.round_id WHERE r.competition_id = c.id) AS games
        FROM competition c LEFT JOIN season s ON s.id = c.season_id
-      WHERE c.type = 'CUP' ORDER BY c.id`
+      ORDER BY c.id`,
   );
 }
 
 export function competitionsForSeason(db, seasonId) {
   return all(
     db,
-    `SELECT c.*, l.slug AS league_slug, l.name AS league_name
-       FROM competition c LEFT JOIN league l ON l.id = c.league_id
+    `SELECT c.*, s.slug AS season_slug FROM competition c
+       LEFT JOIN season s ON s.id = c.season_id
       WHERE c.season_id = ? ORDER BY c.id`,
     seasonId
   );

@@ -1,8 +1,9 @@
-// Domain rules: standings, player statistics, schedule generation, formatting.
-// Everything here is derived from the seeded public data or from explicit
-// settings stored on the competition row.
+// Domain rules: standings, player statistics and formatting.
+// Everything here is derived from the stored competition data or from explicit
+// settings stored on the competition row. Matches are entered by hand, so there
+// is no fixture generation here.
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
-import { all, get, run } from "./db.mjs";
+import { all, get } from "./db.mjs";
 
 /* ------------------------------------------------------------------ format */
 
@@ -71,6 +72,17 @@ export function localDateTimeToUtc(dateStr, timeStr, timeZone = "Europe/Warsaw")
   return new Date(instant);
 }
 
+/** Render a stored UTC instant as wall-clock { date, time } in `tz`. */
+export function localParts(iso, tz = "Europe/Warsaw") {
+  if (!iso) return { date: "", time: "" };
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return { date: "", time: "" };
+  return {
+    date: new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(d),
+    time: new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).format(d),
+  };
+}
+
 export function slugify(input) {
   return String(input || "")
     .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
@@ -98,33 +110,34 @@ export function verifyPassword(password, salt, expected) {
 const outcomeFor = (gf, ga) => (gf > ga ? "W" : gf === ga ? "D" : "L");
 
 /**
- * Compute standings for a league competition from finished games.
+ * Compute the standings of one group from its finished group-stage games.
+ * Pass `groupId` to scope to a single group; omit it to include every group
+ * stage round (useful when the competition has no groups yet).
  * Ranking follows the stored competition settings: points, then goal
- * difference, goals scored and wins. `previous` is used for position deltas.
+ * difference, goals scored and wins. The previous snapshot feeds position deltas.
  */
-export function computeStandings(db, competitionId, { usePrevious = false } = {}) {
+export function computeStandings(db, competitionId, { groupId = null, usePrevious = false } = {}) {
   const comp = get(db, "SELECT * FROM competition WHERE id = ?", competitionId);
   if (!comp) return [];
-  const teams = all(
-    db,
-    `SELECT ct.id AS competition_team_id, t.id AS team_id, t.name AS team_name, t.slug AS team_slug,
+  const teamParams = [competitionId];
+  let teamSql = `SELECT ct.id AS competition_team_id, t.id AS team_id, t.name AS team_name, t.slug AS team_slug,
             t.crest_url
        FROM competition_team ct JOIN team t ON t.id = ct.team_id
-      WHERE ct.competition_id = ?`,
-    competitionId
-  );
-  const games = all(
-    db,
-    `SELECT g.id, g.game_date, g.score_home, g.score_away, g.score_home + g.score_away AS total,
+      WHERE ct.competition_id = ?`;
+  if (groupId !== null) { teamSql += " AND ct.group_id = ?"; teamParams.push(groupId); }
+  const teams = all(db, teamSql, ...teamParams);
+
+  const gameParams = [competitionId];
+  let gameSql = `SELECT g.id, g.game_date, g.score_home, g.score_away, g.score_home + g.score_away AS total,
             ht.competition_team_id AS home_ct, at.competition_team_id AS away_ct
        FROM game g
        JOIN round r ON r.id = g.round_id
        JOIN game_team ht ON ht.game_id = g.id AND ht.team_type = 'HOME'
        JOIN game_team at ON at.game_id = g.id AND at.team_type = 'AWAY'
-      WHERE r.competition_id = ? AND g.status = 'FINISHED'
-      ORDER BY g.game_date ASC, g.id ASC`,
-    competitionId
-  );
+      WHERE r.competition_id = ? AND r.stage = 'GROUP' AND g.status = 'FINISHED'`;
+  if (groupId !== null) { gameSql += " AND r.group_id = ?"; gameParams.push(groupId); }
+  gameSql += " ORDER BY g.game_date ASC, g.id ASC";
+  const games = all(db, gameSql, ...gameParams);
 
   const rows = new Map();
   for (const t of teams) {
@@ -189,7 +202,7 @@ export function computeStandings(db, competitionId, { usePrevious = false } = {}
 
   if (usePrevious) return list;
 
-  const previous = computeStandings(db, competitionId, { usePrevious: true });
+  const previous = computeStandings(db, competitionId, { groupId, usePrevious: true });
   const prevPlace = new Map(previous.map((p) => [p.competition_team_id, p.place]));
   for (const r of list) {
     const before = prevPlace.get(r.competition_team_id);
@@ -294,90 +307,233 @@ export function gamesPlayedByPlayer(db, competitionId) {
   return new Map(rows.map((r) => [r.competition_player_id, r.n]));
 }
 
+/* ----------------------------------------------------------------- helpers */
+
+const pad = (n) => String(n).padStart(2, "0");
+
 /* ---------------------------------------------------------------- fixtures */
 
-/** Round-robin pairings using the circle method. Returns arrays of [home, away]. */
-export function roundRobin(ids, { doubleRound = true } = {}) {
-  const teams = ids.slice();
+/** Deterministic PRNG (mulberry32) so fixture draws are reproducible in tests. */
+export function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+export function shuffle(arr, random = Math.random) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+/**
+ * Round-robin pairings: every team faces every other team once per leg.
+ * With `random` given, the team order and the home/away side of each pairing
+ * are shuffled. `doubleRound` adds a mirrored second leg.
+ * Returns an array of rounds; each round is an array of [home, away] pairs.
+ */
+export function roundRobin(ids, { doubleRound = false, random = null } = {}) {
+  const teams = random ? shuffle(ids, random) : ids.slice();
   if (teams.length % 2 === 1) teams.push(null);
   const n = teams.length;
+  if (n < 2) return [];
+  const arr = teams.slice();
   const rounds = [];
   for (let r = 0; r < n - 1; r++) {
     const pairs = [];
     for (let i = 0; i < n / 2; i++) {
-      const a = teams[i];
-      const b = teams[n - 1 - i];
-      if (a && b) pairs.push(r % 2 === 0 ? [a, b] : [b, a]);
+      const a = arr[i], b = arr[n - 1 - i];
+      if (a === null || b === null) continue;
+      pairs.push(random && random() < 0.5 ? [b, a] : [a, b]);
     }
     rounds.push(pairs);
-    teams.splice(1, 0, teams.pop());
+    arr.splice(1, 0, arr.pop());
   }
   if (doubleRound) {
-    const second = rounds.map((pairs) => pairs.map(([a, b]) => [b, a]));
-    rounds.push(...second);
+    return [...rounds, ...rounds.map((rd) => rd.map(([a, b]) => [b, a]))];
   }
   return rounds;
 }
 
-const pad = (n) => String(n).padStart(2, "0");
-
 /**
- * Create rounds and games for a league competition.
- * Dates are weekly on `weekday` (0=Sunday) starting at startDate, using the
- * supplied kickoff times in order.
+ * Automatic time-slot planner. Assigns date, time and pitch to each game in
+ * the given order so a team never exceeds `maxPerDayPerTeam` games on the same
+ * day and a pitch never hosts two games in the same slot.
+ *
+ * games: [{ id, home, away }] — team identifiers (any comparable value).
+ * busyTeams / busyPitches: occupancy from games scheduled beforehand:
+ *   busyTeams: Map(teamId -> Map("YYYY-MM-DD" -> count))
+ *   busyPitches: Map(pitchId -> Set("YYYY-MM-DD HH:MM"))
+ * Returns { assignments: [{ id, date, time, pitchId }], unscheduled: [id] }.
  */
-export function generateSchedule(db, competitionId, opts) {
-  const {
-    startDate, weekday = 6, times = ["18:00"], pitchId = null,
-    doubleRound = true, startRoundNumber = 1, timeZone = "Europe/Warsaw",
-  } = opts;
-  const teams = all(
-    db,
-    "SELECT id FROM competition_team WHERE competition_id = ? ORDER BY id",
-    competitionId
-  ).map((t) => t.id);
-  if (teams.length < 2) throw new Error("At least two teams are required");
-  const rounds = roundRobin(teams, { doubleRound });
-  const created = [];
-  let cursor = new Date(`${startDate}T12:00:00Z`);
-  while (cursor.getUTCDay() !== Number(weekday)) cursor.setUTCDate(cursor.getUTCDate() + 1);
+export function planSchedule(games, {
+  startDate, fromTime = "18:00", toTime = "23:00", slotMinutes = 60,
+  pitchIds = [], busyTeams = new Map(), busyPitches = new Map(),
+  maxPerDayPerTeam = 1, maxDays = 366,
+} = {}) {
+  const [fh, fm] = String(fromTime).split(":").map(Number);
+  const [th, tm] = String(toTime).split(":").map(Number);
+  const firstMin = fh * 60 + fm;
+  const lastStart = th * 60 + tm - slotMinutes;
+  if (!startDate || lastStart < firstMin) {
+    return { assignments: [], unscheduled: games.map((g) => g.id) };
+  }
+  const teamDays = new Map();
+  const pitchSlots = new Map();
+  const countOf = (t, day) => (busyTeams.get(t)?.get(day) || 0) + (teamDays.get(t)?.get(day) || 0);
+  const pitchTaken = (p, key) => busyPitches.get(p)?.has(key) || pitchSlots.get(p)?.has(key);
 
-  rounds.forEach((pairs, index) => {
-    const roundName = roundRobinName(startRoundNumber + index);
-    const roundId = Number(
-      run(db, "INSERT INTO round (competition_id, name) VALUES (?, ?)", competitionId, roundName).lastInsertRowid
-    );
-    created.push({ roundId, roundName, games: [] });
-    pairs.forEach(([home, away], matchIndex) => {
-      const time = times[matchIndex % times.length] || "18:00";
-      const date = localDateTimeToUtc(isoDate(cursor), time, timeZone);
-      const gameId = Number(
-        run(
-          db,
-          "INSERT INTO game (round_id, pitch_id, game_date, status) VALUES (?, ?, ?, 'NOT_STARTED')",
-          roundId, pitchId, date.toISOString()
-        ).lastInsertRowid
-      );
-      run(db, "INSERT INTO game_team (game_id, competition_team_id, team_type) VALUES (?, ?, 'HOME')", gameId, home);
-      run(db, "INSERT INTO game_team (game_id, competition_team_id, team_type) VALUES (?, ?, 'AWAY')", gameId, away);
-      created[created.length - 1].games.push(gameId);
-    });
-    cursor.setUTCDate(cursor.getUTCDate() + 7);
-  });
-  return created;
+  const assignments = [];
+  const unscheduled = [];
+
+  for (const game of games) {
+    // Each game scans from the first slot so parallel pitches fill the same
+    // hour before the planner moves on to the next one.
+    const cursor = new Date(`${startDate}T00:00:00Z`);
+    let date = startDate;
+    let minutes = firstMin;
+    let placed = false;
+    for (let guard = 0; guard < maxDays * 40 && !placed; guard++) {
+      const key = `${date} ${pad(Math.floor(minutes / 60))}:${pad(minutes % 60)}`;
+      if (countOf(game.home, date) < maxPerDayPerTeam && countOf(game.away, date) < maxPerDayPerTeam) {
+        let pitchId = null;
+        for (const p of pitchIds) {
+          if (!pitchTaken(p, key)) { pitchId = p; break; }
+        }
+        if (pitchIds.length === 0 || pitchId !== null) {
+          assignments.push({ id: game.id, date, time: key.slice(11), pitchId });
+          for (const t of [game.home, game.away]) {
+            if (!teamDays.has(t)) teamDays.set(t, new Map());
+            const m = teamDays.get(t);
+            m.set(date, (m.get(date) || 0) + 1);
+          }
+          if (pitchId !== null) {
+            if (!pitchSlots.has(pitchId)) pitchSlots.set(pitchId, new Set());
+            pitchSlots.get(pitchId).add(key);
+          }
+          placed = true;
+        }
+      }
+      minutes += slotMinutes;
+      if (minutes > lastStart) {
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+        date = cursor.toISOString().slice(0, 10);
+        minutes = firstMin;
+      }
+    }
+    if (!placed) unscheduled.push(game.id);
+  }
+  return { assignments, unscheduled };
 }
 
-/* ----------------------------------------------------------------- helpers */
+/* ---------------------------------------------------------------- playoffs */
 
-export function competitionBySlugs(db, leagueSlug, seasonSlug) {
-  return get(
-    db,
-    `SELECT c.* FROM competition c
-       JOIN league l ON l.id = c.league_id
-       JOIN season s ON s.id = c.season_id
-      WHERE l.slug = ? AND s.slug = ? AND c.type = 'LEAGUE'`,
-    leagueSlug, seasonSlug
-  );
+/**
+ * Rank every group-stage team with an adjusted record so mixed-size groups
+ * compare fairly (e.g. a 3-team group next to a 4-team group): for the teams
+ * of a larger group only the games against the top `minSize` finishers count,
+ * the classic "discard results vs the bottom side" rule.
+ * Returns every team ordered by adjusted points, goal difference, goals and
+ * wins, flagged with `groupWinner` / `qualified` (winners + best runner-up).
+ */
+export function computeGroupSeeds(db, competitionId) {
+  const comp = get(db, "SELECT * FROM competition WHERE id = ?", competitionId);
+  if (!comp) return [];
+  const groups = all(db,
+    "SELECT * FROM competition_group WHERE competition_id = ? ORDER BY ordering, id", competitionId);
+
+  // No groups: the whole group stage is one table; the top two advance.
+  if (groups.length === 0) {
+    const rows = computeStandings(db, competitionId);
+    return rows.map((r) => ({
+      competition_team_id: r.competition_team_id, team_id: r.team_id, team_name: r.team_name,
+      group_id: null, group_name: null, place: r.place,
+      points: r.points, goals_diff: r.goals_diff, goals_scored: r.goals_scored, games_won: r.games_won,
+      groupWinner: r.place === 1, qualified: r.place <= 2,
+    }));
+  }
+
+  const tables = groups
+    .map((g) => ({ group: g, rows: computeStandings(db, competitionId, { groupId: g.id }) }))
+    .filter((t) => t.rows.length > 0);
+  if (tables.length === 0) return [];
+  const minSize = Math.min(...tables.map((t) => t.rows.length));
+
+  // Adjusted record per team from its finished group games that count.
+  const seeds = [];
+  for (const { group, rows } of tables) {
+    const keep = new Set(rows.filter((r) => r.place <= minSize).map((r) => r.competition_team_id));
+    const games = all(db,
+      `SELECT g.score_home, g.score_away,
+              ht.competition_team_id AS home_ct, at.competition_team_id AS away_ct
+         FROM game g JOIN round r ON r.id = g.round_id
+         JOIN game_team ht ON ht.game_id = g.id AND ht.team_type = 'HOME'
+         JOIN game_team at ON at.game_id = g.id AND at.team_type = 'AWAY'
+        WHERE r.competition_id = ? AND r.stage = 'GROUP' AND r.group_id = ?
+          AND g.status = 'FINISHED' AND g.score_home IS NOT NULL AND g.score_away IS NOT NULL`,
+      competitionId, group.id);
+    const rec = new Map(rows.map((r) => [r.competition_team_id, { points: 0, gf: 0, ga: 0, wins: 0 }]));
+    for (const g of games) {
+      if (!keep.has(g.home_ct) || !keep.has(g.away_ct)) continue;
+      for (const [ct, gf, ga] of [[g.home_ct, g.score_home, g.score_away], [g.away_ct, g.score_away, g.score_home]]) {
+        const r = rec.get(ct);
+        r.gf += gf; r.ga += ga;
+        if (gf > ga) { r.wins += 1; r.points += comp.points_win; }
+        else if (gf === ga) { r.points += comp.points_draw; }
+        else { r.points += comp.points_lose; }
+      }
+    }
+    for (const row of rows) {
+      const a = rec.get(row.competition_team_id);
+      seeds.push({
+        competition_team_id: row.competition_team_id, team_id: row.team_id, team_name: row.team_name,
+        group_id: group.id, group_name: group.name, place: row.place,
+        points: a.points, goals_diff: a.gf - a.ga, goals_scored: a.gf, games_won: a.wins,
+        groupWinner: row.place === 1, qualified: false,
+      });
+    }
+  }
+
+  const byRecord = (a, b) =>
+    b.points - a.points || b.goals_diff - a.goals_diff || b.goals_scored - a.goals_scored ||
+    b.games_won - a.games_won || a.team_name.localeCompare(b.team_name);
+  const runnersUp = seeds.filter((s) => s.place === 2).sort(byRecord);
+  const bestRunnerUp = runnersUp[0]?.competition_team_id ?? null;
+  for (const s of seeds) {
+    s.qualified = s.groupWinner || s.competition_team_id === bestRunnerUp;
+    s.bestRunnerUp = s.competition_team_id === bestRunnerUp;
+  }
+  return seeds.sort(byRecord).map((s, i) => ({ ...s, seed: i + 1 }));
+}
+
+/** Qualified seeds in bracket order: group winners plus the best runner-up. */
+export function computeQualifiers(db, competitionId) {
+  return computeGroupSeeds(db, competitionId).filter((s) => s.qualified);
+}
+
+/**
+ * Best-vs-worst bracket pairing for a list of ordered seeds (first = best).
+ * With an odd number of teams the top seed advances with a bye.
+ * Returns { pairs: [[seedA, seedB], ...], bye } using the seed objects given.
+ */
+export function pairSeeds(seeds) {
+  const ids = seeds.slice();
+  let bye = null;
+  if (ids.length % 2 === 1) bye = ids.shift();
+  const pairs = [];
+  for (let i = 0, j = ids.length - 1; i < j; i++, j--) pairs.push([ids[i], ids[j]]);
+  return { pairs, bye };
+}
+
+export function competitionBySlug(db, slug) {
+  return get(db, "SELECT * FROM competition WHERE slug = ?", slug);
 }
 
 export function theme(db) {
@@ -398,10 +554,6 @@ export function statusLabel(status) {
     NOT_STARTED: "Pendiente", STARTED: "En juego", BREAK: "Descanso",
     FINISHED: "Finalizado", CANCELED: "Cancelado",
   }[status] || status;
-}
-
-export function roundRobinName(index) {
-  return `Kolejka ${index}`;
 }
 
 export { pad };

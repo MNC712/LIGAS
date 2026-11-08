@@ -1,13 +1,15 @@
-// Public league-site views.
+// Public league-site views for the unified "grupos + playoff" competition.
 import { all, get } from "./db.mjs";
-import { html, raw, layout, crest, formBadges, pagination, pageNumbers, icons, pageBanner, tabsNav, emptyState, escapeHtml } from "./render.mjs";
+import { html, raw, layout, crest, formBadges, pagination, pageNumbers, icons, pageBanner, tabsNav, emptyState } from "./render.mjs";
 import {
-  computeStandings, computePlayerStats, fmtDate, fmtTime, fmtDateTime, competitionBySlugs,
+  computeStandings, computePlayerStats, fmtDate, fmtTime, fmtDateTime, statusLabel,
 } from "./domain.mjs";
 import * as repo from "./repo.mjs";
 
 const PER_PAGE_RESULTS = 15;
 const PER_PAGE_PLAYERS = 10;
+const KIND_LABEL = { LIGA: "Liga", TORNEO: "Torneo", COPA: "Copa" };
+const kindLabel = (kind) => KIND_LABEL[kind] || kind || "";
 
 function sanitizeRich(input) {
   if (!input) return "";
@@ -24,52 +26,51 @@ function score(game) {
   return `${game.score_home} - ${game.score_away}`;
 }
 
-function cupPhaseLabel(phase) {
-  return {
-    FINAL: "Final (F)", THIRD_PLACE: "Tercer puesto (T)",
-    SEMI_FINAL: "Semifinal (SF)", QUARTER_FINAL: "Cuartos de final (CF)",
-    ROUND_OF_16: "Octavos de final (OF)", GROUP: "Fase de grupos",
-  }[phase] || phase || "Ronda";
+/* ---------------------------------------------------------------- sponsors */
+
+function sponsorStrip(scope) {
+  const sponsors = repo.activeSponsors(scope.db);
+  if (sponsors.length === 0) return "";
+  return html`
+    <section class="panel sponsor-panel">
+      <h2 class="panel-title">Nuestros patrocinadores</h2>
+      <div class="sponsor-grid">
+        ${sponsors.map((s) => html`<a href="${s.link_url || "#"}" target="_blank" rel="noopener" class="sponsor-item">
+          ${s.logo_url ? html`<img src="${s.logo_url}" alt="${s.name}" loading="lazy" />` : html`<span>${s.name}</span>`}
+        </a>`)}
+      </div>
+    </section>`;
 }
 
-const PHASE_ORDER = ["FINAL", "THIRD_PLACE", "SEMI_FINAL", "QUARTER_FINAL", "ROUND_OF_16", "GROUP"];
+/* --------------------------------------------------------- competition ctx */
 
-/* ------------------------------------------------------------- league ctx */
-
-export function leagueContext(db, leagueSlug, seasonSlug) {
-  const competition = competitionBySlugs(db, leagueSlug, seasonSlug);
+export function competitionContext(db, slug) {
+  const competition = get(db, "SELECT * FROM competition WHERE slug = ?", slug);
   if (!competition) return null;
-  const league = get(db, "SELECT * FROM league WHERE id = ?", competition.league_id);
-  const season = get(db, "SELECT * FROM season WHERE id = ?", competition.season_id);
-  return { competition, league, season };
+  const season = competition.season_id ? get(db, "SELECT * FROM season WHERE id = ?", competition.season_id) : null;
+  return { competition, season };
 }
 
-function seasonSelect(scope, competition) {
-  const seasons = repo.seasons(scope.db);
+function competitionSelect(scope, current) {
+  const comps = repo.competitions(scope.db);
+  if (comps.length < 2) return null;
   return html`<label class="select-field">
-    <span class="visually-hidden">Temporada</span>
+    <span class="visually-hidden">Competición</span>
     <select onchange="if(this.value)location.href=this.value">
-      ${seasons.map((s) => {
-        const comp = scope.db.prepare(
-          `SELECT c.id FROM competition c JOIN league l ON l.id=c.league_id
-            WHERE l.slug = ? AND c.season_id = ? AND c.type='LEAGUE'`
-        ).get(competition.league?.slug || competition.league_slug, s.id);
-        const value = comp ? `/${scope.lang}/league-menu/${competition.league?.slug || competition.league_slug}/${s.slug}` : "";
-        return html`<option value="${value}"${s.id === competition.season_id ? " selected" : ""}>${s.name}</option>`;
-      })}
+      ${comps.map((c) => html`<option value="/${scope.lang}/competition/${c.slug}"${c.id === current.id ? " selected" : ""}>${c.name}</option>`)}
     </select>
   </label>`;
 }
 
-function leagueChrome(scope, ctx, active) {
-  const base = `/${scope.lang}/league-menu/${ctx.league.slug}/${ctx.season.slug}`;
+function competitionChrome(scope, ctx, active) {
+  const base = `/${scope.lang}/competition/${ctx.competition.slug}`;
   return {
     base,
     banner: pageBanner({
       org: scope.org,
-      chip: ctx.competition.is_archive ? "Datos archivados" : null,
+      chip: [kindLabel(ctx.competition.kind), ctx.competition.is_archive ? "Datos archivados" : ""].filter(Boolean).join(" · "),
       title: ctx.competition.name,
-      aside: seasonSelect(scope, { ...ctx.competition, league_slug: ctx.league.slug }),
+      aside: competitionSelect(scope, ctx.competition),
     }),
     tabs: tabsNav([
       { href: base, label: "Clasificación", active: active === "tables" },
@@ -82,86 +83,119 @@ function leagueChrome(scope, ctx, active) {
 }
 
 function page(scope, parts) {
-  return layout({
-    org: scope.org, theme: scope.theme, lang: scope.lang,
-    active: parts.active || "", ...parts,
-  }).toString();
+  const sponsors = repo.activeSponsors(scope.db);
+  return layout({ org: scope.org, theme: scope.theme, lang: scope.lang, active: parts.active || "", sponsors, ...parts }).toString();
 }
 
 /* ------------------------------------------------------------------ tables */
 
-export function tablesView(scope, ctx) {
-  const chrome = leagueChrome(scope, ctx, "tables");
-  const rows = computeStandings(scope.db, ctx.competition.id);
+function standingsTable(scope, ctx, base, rows) {
+  return html`
+    <table class="data-table standings-table">
+      <thead>
+        <tr>
+          <th class="col-place">#</th>
+          <th class="col-team">Equipos</th>
+          <th class="num">Pts</th><th class="num">PJ</th><th class="num">PG</th><th class="num">PE</th>
+          <th class="num">PP</th><th class="num">GF</th><th class="num">GC</th><th class="num">DG</th>
+          <th class="col-form">Racha</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.length === 0 ? html`<tr><td colspan="11" class="muted">Sin equipos en esta tabla.</td></tr>` : ""}
+        ${rows.map((r) => html`
+          <tr class="${r.place <= 3 ? "is-podium" : ""}">
+            <td class="col-place">
+              <span class="place-badge">${r.place <= 3 ? (r.place === 1 ? icons.trophy({ size: 16 }) : icons.bars({ size: 16 })) : ""}<span>${r.place}</span></span>
+            </td>
+            <td class="col-team">
+              <a class="team-cell" href="${base}/teams/${r.team_slug}">
+                ${crest(r.crest_url, r.team_name)}
+                <span>${r.team_name}</span>
+              </a>
+            </td>
+            <td class="num strong primary">${r.points}</td>
+            <td class="num">${r.games_played}</td>
+            <td class="num">${r.games_won}</td>
+            <td class="num">${r.games_drawn}</td>
+            <td class="num">${r.games_lost}</td>
+            <td class="num">${r.goals_scored}</td>
+            <td class="num">${r.goals_conceded}</td>
+            <td class="num">${r.goals_diff}</td>
+            <td class="col-form">${formBadges(r.form)}</td>
+          </tr>`)}
+      </tbody>
+    </table>`;
+}
+
+function playoffSection(scope, ctx, base) {
   const tz = scope.theme.timezone;
+  const games = repo.competitionGames(scope.db, ctx.competition.id, { stage: "PLAYOFF", order: "ASC" });
+  if (games.length === 0) return "";
+  const byRound = new Map();
+  for (const g of games) {
+    const key = g.round_id;
+    if (!byRound.has(key)) byRound.set(key, { name: g.round_name || "Eliminatoria", games: [] });
+    byRound.get(key).games.push(g);
+  }
+  return html`
+    <h2 class="section-title">Playoff</h2>
+    <div class="cup-phases">
+      ${[...byRound.values()].map((round) => html`
+        <section class="cup-phase">
+          <h3 class="cup-phase-title">${round.name}</h3>
+          <div class="cup-games">
+            ${round.games.map((g) => html`
+              <a class="cup-game" href="${base}/games/${g.id}">
+                <div class="cup-team"><span>${crest(g.home_crest, g.home_name)} ${g.home_name}</span><strong>${g.score_home ?? "—"}</strong></div>
+                <div class="cup-team"><span>${crest(g.away_crest, g.away_name)} ${g.away_name}</span><strong>${g.score_away ?? "—"}</strong></div>
+                <div class="cup-meta">
+                  <span class="cup-pitch">${icons.pin({ size: 14 })} ${g.pitch_name || "—"}</span>
+                  <span class="cup-code">${g.code || ""}</span>
+                </div>
+                <div class="cup-date muted">${fmtDateTime(g.game_date, tz)}${g.penalty_score_home !== null && g.penalty_score_away !== null ? ` · pen. ${g.penalty_score_home}-${g.penalty_score_away}` : ""}</div>
+              </a>`)}
+          </div>
+        </section>`)}
+    </div>`;
+}
+
+export function competitionView(scope, ctx) {
+  const chrome = competitionChrome(scope, ctx, "tables");
+  const groups = repo.groupsForCompetition(scope.db, ctx.competition.id);
+  const comp = ctx.competition;
+
+  const groupTables = groups.length
+    ? groups.map((gr) => html`
+      <h2 class="section-title">${gr.name}</h2>
+      <section class="panel">${standingsTable(scope, ctx, chrome.base, computeStandings(scope.db, comp.id, { groupId: gr.id }))}</section>`)
+    : html`<section class="panel">${standingsTable(scope, ctx, chrome.base, computeStandings(scope.db, comp.id))}</section>`;
 
   const body = html`
   <div class="container">
-    <section class="panel">
-      <table class="data-table standings-table">
-        <thead>
-          <tr>
-            <th class="col-place">#</th>
-            <th class="col-team">Equipos</th>
-            <th class="num">Pts</th><th class="num">P</th><th class="num">W</th><th class="num">D</th>
-            <th class="num">L</th><th class="num">GF</th><th class="num">GA</th><th class="num">GD</th>
-            <th class="col-form">Racha</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${rows.map((r) => html`
-            <tr class="${r.place <= 3 ? "is-podium" : ""}">
-              <td class="col-place">
-                <span class="place-badge">${r.place <= 3 ? (r.place === 1 ? icons.trophy({ size: 16 }) : icons.bars({ size: 16 })) : ""}<span>${r.place}</span></span>
-              </td>
-              <td class="col-team">
-                <a class="team-cell" href="${chrome.base}/teams/${r.team_slug}">
-                  ${crest(r.crest_url, r.team_name)}
-                  <span>${r.team_name}</span>
-                </a>
-              </td>
-              <td class="num strong primary">${r.points}</td>
-              <td class="num">${r.games_played}</td>
-              <td class="num">${r.games_won}</td>
-              <td class="num">${r.games_drawn}</td>
-              <td class="num">${r.games_lost}</td>
-              <td class="num">${r.goals_scored}</td>
-              <td class="num">${r.goals_conceded}</td>
-              <td class="num">${r.goals_diff}</td>
-              <td class="col-form">${formBadges(r.form)}</td>
-            </tr>`)}
-        </tbody>
-      </table>
-    </section>
-
-    <section class="podium">
-      ${rows.slice(0, 3).map((r) => html`
-        <a class="podium-card podium-${r.place}" href="${chrome.base}/teams/${r.team_slug}">
-          <span class="podium-place">${r.place}</span>
-          ${crest(r.crest_url, r.team_name, "crest crest-lg")}
-          <span class="podium-name">${r.team_name}</span>
-          <span class="podium-points">${r.points} pts</span>
-        </a>`)}
-    </section>
-    <p class="table-note">La clasificación se calcula con los partidos de liga finalizados, con ${ctx.competition.points_win}/${ctx.competition.points_draw}/${ctx.competition.points_lose} puntos por victoria/empate/derrota.</p>
+    <h2 class="section-title">Fase de grupos</h2>
+    ${groupTables}
+    ${playoffSection(scope, ctx, chrome.base)}
+    <p class="table-note">La clasificación se calcula con los partidos de grupo finalizados, con ${comp.points_win}/${comp.points_draw}/${comp.points_lose} puntos por victoria/empate/derrota.</p>
   </div>`;
 
   return page(scope, {
-    title: `Clasificación - ${ctx.competition.name}`, description: `Clasificación de ${ctx.competition.name}`,
-    body, banner: chrome.banner, tabs: chrome.tabs, active: "league",
+    title: `Clasificación - ${comp.name}`, description: `Clasificación de ${comp.name}`,
+    body, banner: chrome.banner, tabs: chrome.tabs, active: "competitions",
   });
 }
 
 /* ---------------------------------------------------------------- schedule */
 
 export function scheduleView(scope, ctx) {
-  const chrome = leagueChrome(scope, ctx, "schedule");
+  const chrome = competitionChrome(scope, ctx, "schedule");
   const tz = scope.theme.timezone;
   const games = repo.competitionGames(scope.db, ctx.competition.id, { status: "NOT_STARTED", order: "ASC" });
   const byRound = new Map();
   for (const g of games) {
-    if (!byRound.has(g.round_id)) byRound.set(g.round_id, { name: g.round_name, games: [] });
-    byRound.get(g.round_id).games.push(g);
+    const key = g.round_id;
+    if (!byRound.has(key)) byRound.set(key, { name: g.round_name || (g.stage === "PLAYOFF" ? "Playoff" : "Jornada"), games: [] });
+    byRound.get(key).games.push(g);
   }
 
   const body = html`
@@ -178,7 +212,7 @@ export function scheduleView(scope, ctx) {
                 <tr>
                   <td class="nowrap muted">${fmtDateTime(g.game_date, tz)}</td>
                   <td><a class="team-cell team-cell-end" href="${chrome.base}/teams/${g.home_slug}"><span>${g.home_name}</span>${crest(g.home_crest, g.home_name)}</a></td>
-                  <td class="center score-cell"><a href="${chrome.base}/games/${g.id}">${g.status === "FINISHED" ? score(g) : "vs"}</a></td>
+                  <td class="center score-cell"><a href="${chrome.base}/games/${g.id}">vs</a></td>
                   <td><a class="team-cell" href="${chrome.base}/teams/${g.away_slug}">${crest(g.away_crest, g.away_name)}<span>${g.away_name}</span></a></td>
                   <td class="muted">${g.pitch_name || "—"}</td>
                 </tr>`)}
@@ -190,14 +224,14 @@ export function scheduleView(scope, ctx) {
 
   return page(scope, {
     title: `Calendario - ${ctx.competition.name}`, body,
-    banner: chrome.banner, tabs: chrome.tabs, active: "league",
+    banner: chrome.banner, tabs: chrome.tabs, active: "competitions",
   });
 }
 
 /* ----------------------------------------------------------------- results */
 
 export function resultsView(scope, ctx, { page: pageNo = 1 } = {}) {
-  const chrome = leagueChrome(scope, ctx, "results");
+  const chrome = competitionChrome(scope, ctx, "results");
   const tz = scope.theme.timezone;
   const total = repo.countCompetitionGames(scope.db, ctx.competition.id, "FINISHED");
   const lastPage = Math.max(1, Math.ceil(total / PER_PAGE_RESULTS));
@@ -229,7 +263,7 @@ export function resultsView(scope, ctx, { page: pageNo = 1 } = {}) {
 
   return page(scope, {
     title: `Resultados - ${ctx.competition.name}`, body,
-    banner: chrome.banner, tabs: chrome.tabs, active: "league",
+    banner: chrome.banner, tabs: chrome.tabs, active: "competitions",
   });
 }
 
@@ -247,11 +281,10 @@ const SORTS = {
 };
 
 export function playersView(scope, ctx, { page: pageNo = 1, sort = "goals", team = "" } = {}) {
-  const chrome = leagueChrome(scope, ctx, "players");
+  const chrome = competitionChrome(scope, ctx, "players");
   const base = `${chrome.base}/players-list`;
   let stats = computePlayerStats(scope.db, ctx.competition.id);
   if (team) stats = stats.filter((p) => p.team_slug === team);
-  stats.sort((SORTS[sort] || SORTS.goals));
   stats.sort((a, b) => (SORTS[sort] || SORTS.goals)(a, b) || a.full_name.localeCompare(b.full_name));
 
   const total = stats.length;
@@ -312,19 +345,19 @@ export function playersView(scope, ctx, { page: pageNo = 1, sort = "goals", team
 
   return page(scope, {
     title: `Jugadores - ${ctx.competition.name}`, body,
-    banner: chrome.banner, tabs: chrome.tabs, active: "league",
+    banner: chrome.banner, tabs: chrome.tabs, active: "competitions",
   });
 }
 
 /* ------------------------------------------------------------- regulations */
 
 export function regulationsView(scope, ctx) {
-  const chrome = leagueChrome(scope, ctx, "regulations");
-  const content = ctx.competition.regulations || ctx.season.regulations || "";
+  const chrome = competitionChrome(scope, ctx, "regulations");
+  const content = ctx.competition.regulations || (ctx.season && ctx.season.regulations) || "";
   const body = html`<div class="container">
     <article class="panel prose">${content ? raw(sanitizeRich(content)) : emptyState("Sin reglamento publicado")}</article>
   </div>`;
-  return page(scope, { title: `Reglamento - ${ctx.competition.name}`, body, banner: chrome.banner, tabs: chrome.tabs, active: "league" });
+  return page(scope, { title: `Reglamento - ${ctx.competition.name}`, body, banner: chrome.banner, tabs: chrome.tabs, active: "competitions" });
 }
 
 /* -------------------------------------------------------------------- team */
@@ -332,10 +365,12 @@ export function regulationsView(scope, ctx) {
 export function teamView(scope, ctx, teamSlug, section = "about") {
   const team = repo.competitionTeamBySlug(scope.db, ctx.competition.id, teamSlug);
   if (!team) return null;
-  const base = `/${scope.lang}/league-menu/${ctx.league.slug}/${ctx.season.slug}`;
+  const base = `/${scope.lang}/competition/${ctx.competition.slug}`;
   const teamBase = `${base}/teams/${team.slug}`;
   const tz = scope.theme.timezone;
-  const standings = computeStandings(scope.db, ctx.competition.id);
+  const standings = team.group_id
+    ? computeStandings(scope.db, ctx.competition.id, { groupId: team.group_id })
+    : computeStandings(scope.db, ctx.competition.id);
   const position = standings.find((s) => s.competition_team_id === team.competition_team_id);
   const stats = computePlayerStats(scope.db, ctx.competition.id).filter((p) => p.competition_team_id === team.competition_team_id);
   const recent = repo.gamesForTeam(scope.db, ctx.competition.id, team.id, { status: "FINISHED", limit: 5 });
@@ -347,7 +382,7 @@ export function teamView(scope, ctx, teamSlug, section = "about") {
     org: scope.org,
     chip: ctx.competition.name,
     title: html`<span class="banner-team">${crest(team.crest_url, team.name, "crest crest-lg")}<span>${team.name}</span></span>`,
-    aside: seasonSelect(scope, { ...ctx.competition, league_slug: ctx.league.slug }),
+    aside: competitionSelect(scope, ctx.competition),
   });
   const tabs = tabsNav([
     { href: teamBase, label: "El equipo", active: section === "about" },
@@ -403,7 +438,7 @@ export function teamView(scope, ctx, teamSlug, section = "about") {
     content = html`
       <div class="two-col">
         <section class="panel">
-          <h2 class="panel-title">Resultados en liga</h2>
+          <h2 class="panel-title">Resultados en la competición</h2>
           <table class="mini-table">
             <tbody>
               <tr><th>Clasificación</th><td>${position ? position.place : "—"}</td></tr>
@@ -436,7 +471,7 @@ export function teamView(scope, ctx, teamSlug, section = "about") {
   }
 
   const body = html`<div class="container">${content}</div>`;
-  return page(scope, { title: `${team.name} - ${ctx.competition.name}`, body, banner, tabs, active: "league" });
+  return page(scope, { title: `${team.name} - ${ctx.competition.name}`, body, banner, tabs, active: "competitions" });
 }
 
 /* ------------------------------------------------------------ player page */
@@ -450,7 +485,7 @@ export function playerView(scope, ctx, teamSlug, playerSlug) {
   const stats = computePlayerStats(scope.db, ctx.competition.id)
     .find((p) => p.player_id === player.id && p.competition_team_id === team.competition_team_id);
   if (!stats) return null;
-  const base = `/${scope.lang}/league-menu/${ctx.league.slug}/${ctx.season.slug}`;
+  const base = `/${scope.lang}/competition/${ctx.competition.slug}`;
   const log = repo.playerSeasonGameLog(scope.db, ctx.competition.id, player.id);
   const tz = scope.theme.timezone;
 
@@ -458,7 +493,7 @@ export function playerView(scope, ctx, teamSlug, playerSlug) {
     org: scope.org,
     chip: team.name,
     title: player.full_name,
-    aside: seasonSelect(scope, { ...ctx.competition, league_slug: ctx.league.slug }),
+    aside: competitionSelect(scope, ctx.competition),
   });
   const tabs = tabsNav([
     { href: `${base}/teams/${team.slug}`, label: "El equipo", active: false },
@@ -499,215 +534,20 @@ export function playerView(scope, ctx, teamSlug, playerSlug) {
       </section>
     </div>
   </div>`;
-  return page(scope, { title: player.full_name, body, banner, tabs, active: "league" });
-}
-
-/* -------------------------------------------------------------------- cup */
-
-export function cupContext(db, slug) {
-  const competition = get(db, "SELECT * FROM competition WHERE type = 'CUP' AND slug = ?", slug);
-  if (!competition) return null;
-  const season = get(db, "SELECT * FROM season WHERE id = ?", competition.season_id);
-  return { competition, season, league: null };
-}
-
-function cupChrome(scope, ctx, active) {
-  const base = `/${scope.lang}/tournament-menu/${ctx.competition.slug}`;
-  return {
-    base,
-    banner: pageBanner({
-      org: scope.org,
-      chip: ctx.competition.is_archive ? "Datos archivados" : null,
-      title: ctx.competition.cup_name || ctx.competition.name,
-      aside: html`<label class="select-field"><span class="visually-hidden">Competición</span>
-        <select onchange="if(this.value)location.href=this.value">
-          <option value="${base}" selected>${ctx.competition.cup_name || ctx.competition.name}</option>
-          ${repo.leagueCompetitions(scope.db).filter((c) => c.season_id === ctx.competition.season_id)
-            .map((c) => html`<option value="/${scope.lang}/league-menu/${c.league_slug}/${c.season_slug}">${c.name}</option>`)}
-        </select></label>`,
-    }),
-    tabs: tabsNav([
-      { href: base, label: "Copa", active: active === "cup" },
-      { href: `${base}/final-standings`, label: "Clasificación final", active: active === "final" },
-      { href: `${base}/schedule`, label: "Calendario", active: active === "schedule" },
-      { href: `${base}/players-list`, label: "Jugadores", active: active === "players" },
-      { href: `${base}/regulations`, label: "Reglamento", active: active === "regulations" },
-    ]),
-  };
-}
-
-export function cupBracketView(scope, ctx) {
-  const chrome = cupChrome(scope, ctx, "cup");
-  const tz = scope.theme.timezone;
-  const games = repo.competitionGames(scope.db, ctx.competition.id, { order: "ASC" });
-  const groups = new Map();
-  for (const g of games) {
-    const phase = g.cup_phase || "FINAL";
-    if (!groups.has(phase)) groups.set(phase, []);
-    groups.get(phase).push(g);
-  }
-  const ordered = [...groups.entries()].sort((a, b) => {
-    const ia = PHASE_ORDER.indexOf(a[0]); const ib = PHASE_ORDER.indexOf(b[0]);
-    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
-  });
-
-  const body = html`<div class="container">
-    ${ordered.length === 0 ? emptyState("Aún no hay partidos de copa") : ""}
-    ${ordered.map(([phase, list]) => html`
-      <section class="cup-phase">
-        <h2 class="cup-phase-title">${cupPhaseLabel(phase)} ${["FINAL", "THIRD_PLACE"].includes(phase) ? icons.trophy({ size: 16 }) : ""}</h2>
-        <div class="cup-games">
-          ${list.map((g) => html`
-            <a class="cup-game" href="${chrome.base}/games/${g.id}">
-              <div class="cup-team"><span>${crest(g.home_crest, g.home_name)} ${g.home_name}</span><strong>${g.score_home ?? "—"}</strong></div>
-              <div class="cup-team"><span>${crest(g.away_crest, g.away_name)} ${g.away_name}</span><strong>${g.score_away ?? "—"}</strong></div>
-              <div class="cup-meta">
-                <span class="cup-pitch">${icons.pin({ size: 14 })} ${g.pitch_name || "—"}</span>
-                <span class="cup-code">${g.code || g.round_name || ""}</span>
-              </div>
-              <div class="cup-date muted">${g.status === "FINISHED" ? fmtDateTime(g.game_date, tz) : fmtDateTime(g.game_date, tz)}${g.penalty_score_home !== null && g.penalty_score_away !== null ? ` · pen. ${g.penalty_score_home}-${g.penalty_score_away}` : ""}</div>
-            </a>`)}
-        </div>
-      </section>`)}
-  </div>`;
-  return page(scope, { title: ctx.competition.cup_name || ctx.competition.name, body, banner: chrome.banner, tabs: chrome.tabs, active: "tournaments" });
-}
-
-export function cupFinalStandings(scope, ctx) {
-  const chrome = cupChrome(scope, ctx, "final");
-  const games = repo.competitionGames(scope.db, ctx.competition.id, { status: "FINISHED" });
-  const placement = new Map();
-  const teamName = new Map();
-  const teamSlug = new Map();
-  for (const g of games) {
-    teamName.set(g.home_ct, g.home_name); teamName.set(g.away_ct, g.away_name);
-    teamSlug.set(g.home_ct, g.home_slug); teamSlug.set(g.away_ct, g.away_slug);
-  }
-  const set = (ct, text) => { if (ct && !placement.has(ct)) placement.set(ct, text); };
-  for (const g of games) {
-    if (g.cup_phase === "FINAL" && g.score_home !== null && g.score_away !== null) {
-      const homeWon = g.score_home > g.score_away ||
-        (g.score_home === g.score_away && (g.penalty_score_home ?? 0) > (g.penalty_score_away ?? 0));
-      set(homeWon ? g.home_ct : g.away_ct, "1");
-      set(homeWon ? g.away_ct : g.home_ct, "2");
-    }
-    if (g.cup_phase === "THIRD_PLACE" && g.score_home !== null && g.score_away !== null) {
-      const homeWon = g.score_home > g.score_away ||
-        (g.score_home === g.score_away && (g.penalty_score_home ?? 0) > (g.penalty_score_away ?? 0));
-      set(homeWon ? g.home_ct : g.away_ct, "3");
-      set(homeWon ? g.away_ct : g.home_ct, "4");
-    }
-    if (g.cup_phase === "SEMI_FINAL" && g.score_home !== null && g.score_away !== null) {
-      const homeWon = g.score_home > g.score_away;
-      set(homeWon ? g.away_ct : g.home_ct, "3-4");
-    }
-    if (g.cup_phase === "QUARTER_FINAL" && g.score_home !== null && g.score_away !== null) {
-      const homeWon = g.score_home > g.score_away;
-      set(homeWon ? g.away_ct : g.home_ct, "5-8");
-    }
-  }
-  const rank = (v) => (v.includes("-") ? Number(v.split("-")[0]) : Number(v));
-  const rows = [...placement.entries()]
-    .map(([ct, place]) => ({ place, name: teamName.get(ct) || "—", slug: teamSlug.get(ct) || "" }))
-    .sort((a, b) => rank(a.place) - rank(b.place) || a.name.localeCompare(b.name));
-
-  const body = html`<div class="container">
-    <section class="panel">
-      ${rows.length === 0 ? emptyState("Aún no hay clasificación final") : html`
-      <table class="data-table">
-        <thead><tr><th class="col-place">Puesto</th><th>Equipo</th></tr></thead>
-        <tbody>${rows.map((r) => html`<tr><td class="place-badge">${r.place}</td><td><a class="team-cell" href="${chrome.base}/teams/${r.slug}">${r.name}</a></td></tr>`)}</tbody>
-      </table>`}
-    </section>
-  </div>`;
-  return page(scope, { title: `Clasificación final - ${ctx.competition.cup_name}`, body, banner: chrome.banner, tabs: chrome.tabs, active: "tournaments" });
-}
-
-export function cupSchedule(scope, ctx) {
-  const chrome = cupChrome(scope, ctx, "schedule");
-  const tz = scope.theme.timezone;
-  const games = repo.competitionGames(scope.db, ctx.competition.id, { status: "NOT_STARTED", order: "ASC" });
-  const body = html`<div class="container"><section class="panel">
-    ${games.length === 0 ? emptyState("No hay partidos programados") : html`
-    <table class="data-table games-table">
-      <thead><tr><th>Fecha</th><th>Equipo 1</th><th class="center">Marcador</th><th>Equipo 2</th><th>Sede</th></tr></thead>
-      <tbody>${games.map((g) => html`<tr>
-        <td class="muted nowrap">${fmtDateTime(g.game_date, tz)}</td>
-        <td>${g.home_name}</td><td class="center muted">vs</td><td>${g.away_name}</td><td class="muted">${g.pitch_name || "—"}</td>
-      </tr>`)}</tbody>
-    </table>`}
-  </section></div>`;
-  return page(scope, { title: `Calendario - ${ctx.competition.cup_name}`, body, banner: chrome.banner, tabs: chrome.tabs, active: "tournaments" });
-}
-
-export function cupPlayers(scope, ctx, { page: pageNo = 1 } = {}) {
-  const chrome = cupChrome(scope, ctx, "players");
-  const stats = computePlayerStats(scope.db, ctx.competition.id).sort((a, b) => b.goals_scored - a.goals_scored);
-  const lastPage = Math.max(1, Math.ceil(stats.length / PER_PAGE_PLAYERS));
-  const current = Math.min(Math.max(1, Number(pageNo) || 1), lastPage);
-  const rows = stats.slice((current - 1) * PER_PAGE_PLAYERS, current * PER_PAGE_PLAYERS);
-  const body = html`<div class="container">
-    <section class="panel"><table class="data-table players-table">
-      <thead><tr><th>Nombre</th><th>Equipo</th><th class="num">PJ</th><th class="num">Goles</th><th class="num">Asist.</th><th class="num">MVP</th><th class="num">Amar.</th><th class="num">Rojas</th></tr></thead>
-      <tbody>${rows.map((p) => html`<tr>
-        <td><a class="player-cell" href="${chrome.base}/teams/${p.team_slug}/players/${p.slug}">
-          ${p.avatar_url ? html`<img class="avatar" src="${p.avatar_url}" alt="" />` : html`<span class="avatar avatar--empty">${(p.first_name?.[0] || "") + (p.last_name?.[0] || "")}</span>`}
-          <span>${p.full_name}</span></a></td>
-        <td class="muted">${p.team_name}</td><td class="num">${p.games_played}</td><td class="num strong">${p.goals_scored}</td>
-        <td class="num">${p.assists}</td><td class="num">${p.mvp}</td><td class="num">${p.yellow_cards}</td><td class="num">${p.red_cards}</td>
-      </tr>`)}</tbody>
-    </table></section>
-    ${pageNumbers({ page: current, lastPage, href: (p) => `${chrome.base}/players-list?page=${p}` })}
-  </div>`;
-  return page(scope, { title: `Jugadores - ${ctx.competition.cup_name}`, body, banner: chrome.banner, tabs: chrome.tabs, active: "tournaments" });
-}
-
-export function cupRegulations(scope, ctx) {
-  const chrome = cupChrome(scope, ctx, "regulations");
-  const content = ctx.competition.regulations || "";
-  const body = html`<div class="container"><article class="panel prose">${content ? raw(sanitizeRich(content)) : emptyState("Sin reglamento publicado")}</article></div>`;
-  return page(scope, { title: `Reglamento - ${ctx.competition.cup_name}`, body, banner: chrome.banner, tabs: chrome.tabs, active: "tournaments" });
-}
-
-export function cupTeamView(scope, ctx, teamSlug) {
-  const team = repo.competitionTeamBySlug(scope.db, ctx.competition.id, teamSlug);
-  if (!team) return null;
-  const base = `/${scope.lang}/tournament-menu/${ctx.competition.slug}`;
-  const games = repo.gamesForTeam(scope.db, ctx.competition.id, team.id, { limit: 30 });
-  const stats = computePlayerStats(scope.db, ctx.competition.id).filter((p) => p.competition_team_id === team.competition_team_id).sort((a, b) => b.goals_scored - a.goals_scored);
-  const banner = pageBanner({ org: scope.org, chip: ctx.competition.cup_name, title: html`<span class="banner-team">${crest(team.crest_url, team.name, "crest crest-lg")}<span>${team.name}</span></span>` });
-  const tz = scope.theme.timezone;
-  const body = html`<div class="container">
-    <div class="two-col">
-      <section class="panel"><h2 class="panel-title">Partidos de copa</h2>
-        <table class="data-table compact"><tbody>${games.map((g) => {
-          const home = g.home_ct === team.competition_team_id;
-          return html`<tr><td class="muted nowrap">${fmtDate(g.game_date, tz)}</td>
-            <td>${home ? g.away_name : g.home_name}</td>
-            <td class="num">${home ? `${g.score_home ?? "—"} - ${g.score_away ?? "—"}` : `${g.score_away ?? "—"} - ${g.score_home ?? "—"}`}</td></tr>`;
-        })}</tbody></table>
-      </section>
-      <section class="panel"><h2 class="panel-title">Jugadores</h2>
-        <table class="data-table compact"><tbody>${stats.map((p) => html`<tr><td>${p.full_name}</td><td class="num">${p.goals_scored}</td></tr>`)}</tbody></table>
-      </section>
-    </div>
-  </div>`;
-  return page(scope, { title: team.name, body, banner, tabs: tabsNav([{ href: base, label: "Copa", active: true }]), active: "tournaments" });
+  return page(scope, { title: player.full_name, body, banner, tabs, active: "competitions" });
 }
 
 /* --------------------------------------------------------------- game page */
 
-export function matchView(scope, ctx, kind, gameId) {
+export function matchView(scope, ctx, gameId) {
   const game = repo.gameById(scope.db, Number(gameId));
   if (!game) return null;
-  const base = kind === "league"
-    ? `/${scope.lang}/league-menu/${ctx.league.slug}/${ctx.season.slug}`
-    : `/${scope.lang}/tournament-menu/${ctx.competition.slug}`;
+  const base = `/${scope.lang}/competition/${ctx.competition.slug}`;
   const events = repo.gameEvents(scope.db, game.id);
   const tz = scope.theme.timezone;
   const goals = events.filter((e) => e.system_name === "goal" || e.system_name === "own_goal");
   const cards = events.filter((e) => e.system_name === "yellow_card" || e.system_name === "red_card");
-  const title = kind === "league" ? ctx.competition.name : (ctx.competition.cup_name || ctx.competition.name);
+  const title = ctx.competition.name;
 
   const banner = pageBanner({
     org: scope.org, chip: game.round_name ? `${title} · ${game.round_name}` : title,
@@ -715,16 +555,21 @@ export function matchView(scope, ctx, kind, gameId) {
     aside: html`<a class="btn btn-outline-light" href="${base}">Volver a la competición</a>`,
   });
 
-  const body = html`<div class="container">
-    <section class="scoreboard panel">
+  const isLive = game.status === "STARTED" || game.status === "BREAK";
+
+  const body = html`<div class="container" data-live-game="${game.id}">
+    <section class="scoreboard panel ${isLive ? "is-live" : ""}">
       <div class="scoreboard-team">
         <a href="${base}/teams/${game.home_slug}">${crest(game.home_crest, game.home_name, "crest crest-xl")}<span>${game.home_name}</span></a>
       </div>
       <div class="scoreboard-centre">
-        <div class="scoreboard-score">${score(game)}</div>
-        <div class="muted">${game.status === "FINISHED" ? "Finalizado" : game.status === "STARTED" ? "En directo" : "Programado"}</div>
+        <div class="scoreboard-score" data-live="score">${score(game)}</div>
+        <div class="scoreboard-status">
+          <span class="live-badge" data-live="badge"${isLive ? "" : " hidden"}><span class="live-dot" aria-hidden="true"></span>En directo</span>
+          <span class="muted" data-live="status">${statusLabel(game.status)}</span>
+        </div>
         <div class="muted small">${fmtDateTime(game.game_date, tz)}</div>
-        ${game.penalty_score_home !== null && game.penalty_score_away !== null ? html`<div class="muted small">Penaltis ${game.penalty_score_home} - ${game.penalty_score_away}</div>` : ""}
+        <div class="muted small" data-live="penalties">${game.penalty_score_home !== null && game.penalty_score_away !== null ? `Penaltis ${game.penalty_score_home} - ${game.penalty_score_away}` : ""}</div>
       </div>
       <div class="scoreboard-team">
         <a href="${base}/teams/${game.away_slug}">${crest(game.away_crest, game.away_name, "crest crest-xl")}<span>${game.away_name}</span></a>
@@ -734,32 +579,40 @@ export function matchView(scope, ctx, kind, gameId) {
     <div class="two-col">
       <section class="panel">
         <h2 class="panel-title">Goles</h2>
-        ${goals.length === 0 ? emptyState("Sin goles registrados") : html`<ul class="timeline">
-          ${goals.map((e) => html`<li><span class="timeline-minute">${e.time}′</span>
-            <span class="timeline-body"><strong>${e.player_name || e.name}</strong>
-            <span class="muted small">${e.team_name || ""}${e.system_name === "own_goal" || e.for_opposite_team ? " · gol en propia" : ""}</span></span></li>`)}
-        </ul>`}
+        <div data-live="goals">
+          ${goals.length === 0 ? emptyState("Sin goles registrados") : html`<ul class="timeline">
+            ${goals.map((e) => html`<li><span class="timeline-minute">${e.time}′</span>
+              <span class="timeline-body"><strong>${e.player_name || e.name}</strong>
+              <span class="muted small">${e.team_name || ""}${e.system_name === "own_goal" || e.for_opposite_team ? " · gol en propia" : ""}</span></span></li>`)}
+          </ul>`}
+        </div>
         <h2 class="panel-title">Tarjetas</h2>
-        ${cards.length === 0 ? emptyState("Sin tarjetas registradas") : html`<ul class="timeline">
-          ${cards.map((e) => html`<li><span class="timeline-minute">${e.time}′</span>
-            <span class="timeline-body"><strong>${e.player_name || e.name}</strong>
-            <span class="muted small">${e.team_name || ""} · ${e.system_name === "yellow_card" ? "Tarjeta amarilla" : "Tarjeta roja"}</span></span>
-            <span class="card ${e.system_name === "yellow_card" ? "card-yellow" : "card-red"}"></span></li>`)}
-        </ul>`}
+        <div data-live="cards">
+          ${cards.length === 0 ? emptyState("Sin tarjetas registradas") : html`<ul class="timeline">
+            ${cards.map((e) => html`<li><span class="timeline-minute">${e.time}′</span>
+              <span class="timeline-body"><strong>${e.player_name || e.name}</strong>
+              <span class="muted small">${e.team_name || ""} · ${e.system_name === "yellow_card" ? "Tarjeta amarilla" : "Tarjeta roja"}</span></span>
+              <span class="card ${e.system_name === "yellow_card" ? "card-yellow" : "card-red"}"></span></li>`)}
+          </ul>`}
+        </div>
       </section>
       <section class="panel">
         <h2 class="panel-title">Información del partido</h2>
         <table class="mini-table"><tbody>
           <tr><th>Jornada</th><td>${game.round_name || "—"}</td></tr>
+          <tr><th>Fase</th><td>${game.stage === "PLAYOFF" ? "Playoff" : "Grupos"}</td></tr>
           <tr><th>Sede</th><td>${game.pitch_name || "—"}${game.pitch_city ? `, ${game.pitch_city}` : ""}</td></tr>
           <tr><th>Fecha</th><td>${fmtDateTime(game.game_date, tz)}</td></tr>
-          <tr><th>Estado</th><td>${game.status}</td></tr>
+          <tr><th>Estado</th><td>${statusLabel(game.status)}</td></tr>
           <tr><th>Código</th><td>${game.code || "—"}</td></tr>
         </tbody></table>
       </section>
     </div>
   </div>`;
-  return page(scope, { title: `${game.home_name} vs ${game.away_name}`, body, banner, active: kind === "league" ? "league" : "tournaments" });
+  return page(scope, {
+    title: `${game.home_name} vs ${game.away_name}`, body, banner,
+    active: "competitions", scripts: ["/live.js"],
+  });
 }
 
 /* ------------------------------------------------------------------ others */
@@ -773,13 +626,10 @@ export function calendarView(scope, { month } = {}) {
   const games = all(
     scope.db,
     `SELECT g.id, g.game_date, g.status, g.score_home, g.score_away,
-            ht.name AS home_name, at.name AS away_name, r.competition_id, c.type AS comp_type, c.slug AS cup_slug, c.name AS comp_name,
-            l.slug AS league_slug, s.slug AS season_slug
+            ht.name AS home_name, at.name AS away_name, c.slug AS competition_slug, c.name AS comp_name
        FROM game g
        JOIN round r ON r.id = g.round_id
        JOIN competition c ON c.id = r.competition_id
-       LEFT JOIN league l ON l.id = c.league_id
-       LEFT JOIN season s ON s.id = c.season_id
        JOIN game_team ght ON ght.game_id = g.id AND ght.team_type = 'HOME'
        JOIN competition_team hct ON hct.id = ght.competition_team_id JOIN team ht ON ht.id = hct.team_id
        JOIN game_team gat ON gat.game_id = g.id AND gat.team_type = 'AWAY'
@@ -819,10 +669,7 @@ export function calendarView(scope, { month } = {}) {
         const list = byDay.get(key) || [];
         return html`<div class="calendar-cell${list.length ? " has-games" : ""}">
           <span class="calendar-day">${d}</span>
-          ${list.map((g) => {
-            const href = g.comp_type === "CUP" ? `/${scope.lang}/tournament-menu/${g.cup_slug}` : `/${scope.lang}/league-menu/${g.league_slug}/${g.season_slug}`;
-            return html`<a class="calendar-game" href="${href}"><span class="calendar-time">${fmtTime(g.game_date, tz)}</span><span class="calendar-teams">${g.home_name} – ${g.away_name}</span></a>`;
-          })}
+          ${list.map((g) => html`<a class="calendar-game" href="/${scope.lang}/competition/${g.competition_slug}"><span class="calendar-time">${fmtTime(g.game_date, tz)}</span><span class="calendar-teams">${g.home_name} – ${g.away_name}</span></a>`)}
         </div>`;
       })}
     </div>
@@ -833,53 +680,12 @@ export function calendarView(scope, { month } = {}) {
   });
 }
 
-export function contactView(scope, { sent = false, error = "" } = {}) {
-  const fields = all(scope.db, "SELECT * FROM contact_field ORDER BY id");
-  const socials = (() => { try { return JSON.parse(scope.org.socials_json || "{}"); } catch { return {}; } })();
-  const body = html`<div class="container">
-    <div class="two-col">
-      <section class="panel">
-        <h2 class="panel-title">Contacta con nosotros</h2>
-        ${sent ? html`<div class="alert alert-success">Tu mensaje se ha enviado al organizador.</div>` : ""}
-        ${error ? html`<div class="alert alert-error">${error}</div>` : ""}
-        <form method="post" action="/${scope.lang}/contact" class="form">
-          <label>Nombre<input type="text" name="name" required /></label>
-          <label>Email<input type="email" name="email" required /></label>
-          <label>Asunto<input type="text" name="subject" /></label>
-          <label>Mensaje<textarea name="message" rows="5" required></textarea></label>
-          <button class="btn btn-primary" type="submit">Enviar mensaje</button>
-        </form>
-      </section>
-      <section class="panel">
-        <h2 class="panel-title">Organizador</h2>
-        ${fields.map((f) => html`<p class="contact-line"><strong>${f.name}</strong><br /><a href="mailto:${f.value}">${f.value}</a></p>`)}
-        ${scope.org.contact_email ? html`<p class="contact-line"><a href="mailto:${scope.org.contact_email}">${scope.org.contact_email}</a></p>` : ""}
-        <h3 class="panel-subtitle">Redes sociales</h3>
-        <ul class="plain-list">
-          ${Object.entries(socials).filter(([, v]) => v).map(([k, v]) => html`<li><a href="${v}" target="_blank" rel="noopener">${k[0].toUpperCase() + k.slice(1)}</a></li>`)}
-        </ul>
-      </section>
-    </div>
-  </div>`;
-  return page(scope, { title: "Contacto", body, active: "contact", banner: pageBanner({ org: scope.org, title: "Contacto" }) });
-}
-
-export function galleryView(scope) {
-  const images = repo.galleryImages(scope.db);
-  const body = html`<div class="container">
-    ${images.length === 0 ? emptyState("Sin fotos publicadas") : html`<div class="gallery-grid">
-      ${images.map((url) => html`<a class="gallery-item" href="${url}" target="_blank" rel="noopener"><img src="${url}" alt="" loading="lazy" /></a>`)}
-    </div>`}
-  </div>`;
-  return page(scope, { title: "Galería", body, active: "gallery", banner: pageBanner({ org: scope.org, title: "Galería" }) });
-}
-
 export function archiveView(scope) {
   const seasons = repo.seasons(scope.db);
   const body = html`<div class="container"><section class="panel">
     <table class="data-table"><thead><tr><th>Nombre</th><th>Fecha de inicio</th></tr></thead>
       <tbody>${seasons.map((s) => html`<tr>
-        <td><a href="/${scope.lang}/league-menu/seasons-archive/${s.slug}">${s.name}</a></td>
+        <td><a href="/${scope.lang}/archive/${s.slug}">${s.name}</a></td>
         <td class="muted">${s.start_date}</td></tr>`)}</tbody>
     </table>
   </section></div>`;
@@ -893,18 +699,13 @@ export function seasonArchiveView(scope, slug) {
   const body = html`<div class="container">
     <section class="panel">
       <h2 class="panel-title">${season.name}</h2>
-      <p class="muted">${season.start_date} – ${season.end_date}</p>
+      <p class="muted">${season.start_date || ""} – ${season.end_date || ""}</p>
       <div class="card-list">
-        ${comps.map((c) => {
-          const href = c.type === "CUP"
-            ? `/${scope.lang}/tournament-menu/${c.slug}`
-            : `/${scope.lang}/league-menu/${c.league_slug}/${season.slug}`;
-          return html`<a class="card-link" href="${href}">
-            <span class="card-link-title">${c.name}</span>
-            <span class="muted">${c.type === "CUP" ? "Copa" : "Liga"}${c.is_archive ? " · archivada" : ""}</span>
-            ${icons.arrow({ size: 18 })}
-          </a>`;
-        })}
+        ${comps.map((c) => html`<a class="card-link" href="/${scope.lang}/competition/${c.slug}">
+          <span class="card-link-title">${c.name}</span>
+          <span class="muted">${c.is_archive ? "Archivada" : ""}</span>
+          ${icons.arrow({ size: 18 })}
+        </a>`)}
         ${comps.length === 0 ? emptyState("Sin competiciones en esta temporada") : ""}
       </div>
     </section>
@@ -912,81 +713,80 @@ export function seasonArchiveView(scope, slug) {
   return page(scope, { title: season.name, body, active: "archive", banner: pageBanner({ org: scope.org, chip: "Archivo de temporadas", title: season.name }) });
 }
 
-export function newsView(scope) {
-  const posts = repo.posts(scope.db);
+export function competitionsView(scope) {
+  const comps = repo.competitions(scope.db);
   const body = html`<div class="container">
-    ${posts.length === 0 ? emptyState("Aún no hay noticias") : html`<div class="card-list">
-      ${posts.map((p) => html`<a class="card-link" href="/${scope.lang}/news/${p.slug}">
-        <span class="card-link-title">${p.title}</span>
-        <span class="muted">${fmtDate(p.created_at, scope.theme.timezone)}</span>
+    ${comps.length === 0 ? emptyState("Aún no hay competiciones") : ""}
+    <div class="card-list">
+      ${comps.map((c) => html`<a class="card-link" href="/${scope.lang}/competition/${c.slug}">
+        <span class="card-link-title">${c.name}</span>
+        <span class="muted">${kindLabel(c.kind)} · ${c.season_name || ""} · ${c.teams} equipos</span>
         ${icons.arrow({ size: 18 })}
       </a>`)}
-    </div>`}
+    </div>
   </div>`;
-  return page(scope, { title: "Noticias", body, active: "news", banner: pageBanner({ org: scope.org, title: "Noticias" }) });
-}
-
-export function postView(scope, slug) {
-  const post = repo.postBySlug(scope.db, slug);
-  if (!post) return null;
-  const body = html`<div class="container"><article class="panel prose">
-    <h1>${post.title}</h1>
-    <p class="muted">${fmtDate(post.created_at, scope.theme.timezone)}</p>
-    ${post.image_url ? html`<img src="${post.image_url}" alt="" style="max-width:100%;border-radius:8px" />` : ""}
-    ${raw(sanitizeRich(post.content))}
-  </article></div>`;
-  return page(scope, { title: post.title, body, active: "news", banner: pageBanner({ org: scope.org, title: post.title }) });
-}
-
-export function tournamentsView(scope) {
-  const comps = repo.leagueCompetitions(scope.db).concat(repo.cupCompetitions(scope.db));
-  const body = html`<div class="container"><div class="card-list">
-    ${comps.map((c) => html`<a class="card-link" href="${c.type === "CUP"
-      ? `/${scope.lang}/tournament-menu/${c.slug}`
-      : `/${scope.lang}/league-menu/${c.league_slug}/${c.season_slug}`}">
-      <span class="card-link-title">${c.type === "CUP" ? (c.cup_name || c.name) : c.name}</span>
-      <span class="muted">${c.season_name || ""} · ${c.type === "CUP" ? "Copa" : "Liga"}</span>
-      ${icons.arrow({ size: 18 })}
-    </a>`)}
-  </div></div>`;
-  return page(scope, { title: "Torneos", body, active: "tournaments", banner: pageBanner({ org: scope.org, title: "Torneos" }) });
+  return page(scope, { title: "Competiciones", body, active: "competitions", banner: pageBanner({ org: scope.org, title: "Competiciones" }) });
 }
 
 /* -------------------------------------------------------------------- home */
 
 export function homeView(scope) {
   const tz = scope.theme.timezone;
-  const league = repo.leagueCompetitions(scope.db)[0];
-  const season = league ? get(scope.db, "SELECT * FROM season WHERE id = ?", league.season_id) : null;
-  const leagueBase = league ? `/${scope.lang}/league-menu/${league.league_slug}/${league.season_slug}` : null;
-  const cup = repo.cupCompetitions(scope.db)[0];
-  const latest = league ? repo.competitionGames(scope.db, league.id, { status: "FINISHED", order: "DESC", limit: 6 }) : [];
-  const upcoming = league ? repo.competitionGames(scope.db, league.id, { status: "NOT_STARTED", order: "ASC", limit: 4 }) : [];
-  const standings = league ? computeStandings(scope.db, league.id).slice(0, 5) : [];
-  const sponsors = repo.sponsors(scope.db);
-  const posts = repo.posts(scope.db).slice(0, 3);
-  const gallery = repo.galleryImages(scope.db).slice(0, 6);
+  const comp = repo.competitions(scope.db)[0];
+  const base = comp ? `/${scope.lang}/competition/${comp.slug}` : null;
+  const latest = comp ? repo.competitionGames(scope.db, comp.id, { status: "FINISHED", order: "DESC", limit: 6 }) : [];
+  const upcoming = comp ? repo.competitionGames(scope.db, comp.id, { status: "NOT_STARTED", order: "ASC", limit: 4 }) : [];
+  const standings = comp ? computeStandings(scope.db, comp.id).slice(0, 5) : [];
+
+  const live = comp ? repo.liveGames(scope.db, comp.id) : [];
+  const heroMatch = live[0] || null;
+  const heroNext = heroMatch ? [] : upcoming.slice(0, 2);
+
+  const heroSide = heroMatch
+    ? html`<div class="hero-match" data-live-game="${heroMatch.id}">
+      <span class="hero-match-tag hero-match-tag--live" data-live="badge"><span class="live-dot" aria-hidden="true"></span>En vivo</span>
+      <div class="hero-match-teams">
+        <div class="hero-match-team">${crest(heroMatch.home_crest, heroMatch.home_name, "crest crest-lg")}<span>${heroMatch.home_name}</span></div>
+        <div class="hero-match-score" data-live="score">${score(heroMatch)}</div>
+        <div class="hero-match-team">${crest(heroMatch.away_crest, heroMatch.away_name, "crest crest-lg")}<span>${heroMatch.away_name}</span></div>
+      </div>
+      <span class="hero-match-meta"><span data-live="status">${statusLabel(heroMatch.status)}</span>${heroMatch.pitch_name ? ` · ${heroMatch.pitch_name}` : ""}</span>
+      ${base ? html`<a class="btn btn-light btn-block" href="${base}/games/${heroMatch.id}">Seguir el partido ${icons.arrow({ size: 16 })}</a>` : ""}
+    </div>`
+    : heroNext.length
+      ? html`<div class="hero-match">
+        <span class="hero-match-tag">Próximos partidos</span>
+        <div class="hero-match-next">
+          ${heroNext.map((g) => html`<a class="hero-next-row" href="${base}/games/${g.id}">
+            <span class="hero-next-date">${fmtDateTime(g.game_date, tz)}</span>
+            <span class="hero-next-teams">${g.home_name} <em>vs</em> ${g.away_name}</span>
+            <span class="hero-next-pitch">${g.pitch_name || ""}</span>
+          </a>`)}
+        </div>
+        ${base ? html`<a class="btn btn-outline-light btn-block" href="${base}/schedule">Ver calendario ${icons.arrow({ size: 16 })}</a>` : ""}
+      </div>`
+      : "";
 
   const banner = html`<section class="home-hero">
-    <div class="home-hero-inner">
-      <div>
-        <span class="banner-chip">${season ? season.name : "Liga"}</span>
+    <div class="home-hero-inner${heroSide ? " has-side" : ""}">
+      <div class="home-hero-copy">
+        <span class="banner-chip">${comp ? comp.name : "Competiciones"}</span>
         <h1>${scope.org.name}</h1>
-        <p class="hero-sub">Resultados, clasificación, calendario y estadísticas de jugadores: todo sobre la liga en un solo lugar.</p>
+        <p class="hero-sub">Resultados, clasificación, calendario y estadísticas de jugadores: todo sobre la competición en un solo lugar.</p>
         <div class="hero-actions">
-          ${leagueBase ? html`<a class="btn btn-light" href="${leagueBase}">Ver clasificación ${icons.arrow({ size: 16 })}</a>` : ""}
-          ${cup ? html`<a class="btn btn-outline-light" href="/${scope.lang}/tournament-menu/${cup.slug}">Ver la copa</a>` : ""}
+          ${base ? html`<a class="btn btn-light" href="${base}">Ver clasificación ${icons.arrow({ size: 16 })}</a>` : ""}
         </div>
       </div>
+      ${heroSide}
     </div>
   </section>`;
 
   const body = html`<div class="container">
     <div class="home-grid">
       <section class="panel">
-        <div class="panel-head"><h2 class="panel-title">Últimos resultados</h2>${leagueBase ? html`<a class="link-more" href="${leagueBase}/results">Todos los resultados ${icons.arrow({ size: 14 })}</a>` : ""}</div>
+        <div class="panel-head"><h2 class="panel-title">Últimos resultados</h2>${base ? html`<a class="link-more" href="${base}/results">Todos los resultados ${icons.arrow({ size: 14 })}</a>` : ""}</div>
         <div class="result-list">
-          ${latest.map((g) => html`<a class="result-row" href="${leagueBase}/games/${g.id}">
+          ${latest.map((g) => html`<a class="result-row" href="${base}/games/${g.id}">
             <span class="result-date muted nowrap">${fmtDate(g.game_date, tz)}</span>
             <span class="result-team team-cell-end"><span>${g.home_name}</span>${crest(g.home_crest, g.home_name)}</span>
             <span class="result-score">${score(g)}</span>
@@ -996,12 +796,12 @@ export function homeView(scope) {
       </section>
 
       <section class="panel">
-        <div class="panel-head"><h2 class="panel-title">Clasificación</h2>${leagueBase ? html`<a class="link-more" href="${leagueBase}">Tabla completa ${icons.arrow({ size: 14 })}</a>` : ""}</div>
+        <div class="panel-head"><h2 class="panel-title">Clasificación</h2>${base ? html`<a class="link-more" href="${base}">Tabla completa ${icons.arrow({ size: 14 })}</a>` : ""}</div>
         <table class="data-table compact standings-mini">
           <thead><tr><th class="col-place">#</th><th>Equipo</th><th class="num">PJ</th><th class="num">DG</th><th class="num">Pts</th></tr></thead>
           <tbody>${standings.map((r) => html`<tr class="${r.place <= 3 ? "is-podium" : ""}">
             <td class="col-place"><span class="place-badge"><span>${r.place}</span></span></td>
-            <td><a class="team-cell" href="${leagueBase}/teams/${r.team_slug}">${crest(r.crest_url, r.team_name)}<span>${r.team_name}</span></a></td>
+            <td><a class="team-cell" href="${base}/teams/${r.team_slug}">${crest(r.crest_url, r.team_name)}<span>${r.team_name}</span></a></td>
             <td class="num">${r.games_played}</td><td class="num">${r.goals_diff}</td><td class="num strong primary">${r.points}</td>
           </tr>`)}</tbody>
         </table>
@@ -1009,7 +809,7 @@ export function homeView(scope) {
     </div>
 
     <section class="panel">
-      <div class="panel-head"><h2 class="panel-title">Próximos partidos</h2>${leagueBase ? html`<a class="link-more" href="${leagueBase}/schedule">Calendario completo ${icons.arrow({ size: 14 })}</a>` : ""}</div>
+      <div class="panel-head"><h2 class="panel-title">Próximos partidos</h2>${base ? html`<a class="link-more" href="${base}/schedule">Calendario completo ${icons.arrow({ size: 14 })}</a>` : ""}</div>
       ${upcoming.length === 0 ? emptyState("No hay próximos partidos") : html`<div class="upcoming-row">
         ${upcoming.map((g) => html`<div class="upcoming-card">
           <span class="upcoming-date">${fmtDateTime(g.game_date, tz)}</span>
@@ -1019,25 +819,13 @@ export function homeView(scope) {
       </div>`}
     </section>
 
-    ${sponsors.length ? html`<section class="sponsors">
-      <h2 class="sponsors-title">Socio tecnológico</h2>
-      <p class="sponsors-sub">¡Juntos jugamos hacia el mismo objetivo!</p>
-      <div class="sponsor-strip">${sponsors.map((s) => html`<a class="sponsor" href="${s.url || "#"}" target="_blank" rel="noopener"><img src="${s.image_url}" alt="${s.name}" loading="lazy" /></a>`)}</div>
-    </section>` : ""}
-
-    ${gallery.length ? html`<section class="panel">
-      <div class="panel-head"><h2 class="panel-title">Galería</h2><a class="link-more" href="/${scope.lang}/gallery">Ver todas las fotos ${icons.arrow({ size: 14 })}</a></div>
-      <div class="gallery-grid">${gallery.map((u) => html`<a class="gallery-item" href="${u}" target="_blank" rel="noopener"><img src="${u}" alt="" loading="lazy" /></a>`)}</div>
-    </section>` : ""}
-
-    ${posts.length ? html`<section class="panel">
-      <div class="panel-head"><h2 class="panel-title">Últimas noticias</h2><a class="link-more" href="/${scope.lang}/news">Todas las noticias ${icons.arrow({ size: 14 })}</a></div>
-      <div class="card-list">${posts.map((p) => html`<a class="card-link" href="/${scope.lang}/news/${p.slug}">
-        <span class="card-link-title">${p.title}</span><span class="muted">${fmtDate(p.created_at, tz)}</span>${icons.arrow({ size: 18 })}</a>`)}</div>
-    </section>` : ""}
+    ${sponsorStrip(scope)}
   </div>`;
 
-  return page(scope, { title: "", description: `${scope.org.name} — resultados, clasificación, calendario y estadísticas de jugadores.`, body, banner, active: "home" });
+  return page(scope, {
+    title: "", description: `${scope.org.name} — resultados, clasificación, calendario y estadísticas de jugadores.`,
+    body, banner, active: "home", scripts: heroMatch ? ["/live.js"] : [],
+  });
 }
 
 export function notFoundView(scope) {
